@@ -23,6 +23,15 @@ class Actor:
         pyautogui.FAILSAFE = True
         pyautogui.PAUSE = 0.0
 
+    def set_abort_event(self, abort_event: Event | None) -> None:
+        self._abort_event = abort_event
+
+    def set_delay_s(self, delay_s: float) -> None:
+        delay_s = float(delay_s)
+        if delay_s < 0:
+            raise ValueError("delay_s must be >= 0.")
+        self._config = ActionConfig(delay_s=delay_s)
+
     def _check_abort(self) -> None:
         if self._abort_event is not None and self._abort_event.is_set():
             raise KeyboardInterrupt()

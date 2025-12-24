@@ -559,6 +559,12 @@ class ChatApp(App[None]):
             "SESSIONS": ("SESSIONS", t.user),
             "HELP": ("HELP", t.dim),
             "CONFIRM": ("CONFIRM", t.accent),
+            "WORKSPACE": ("WORKSPACE", t.dim),
+            "MODEL": ("MODEL", t.dim),
+            "MAX AGENT STEPS": ("MAX AGENT STEPS", t.dim),
+            "ACTION DELAY": ("ACTION DELAY", t.dim),
+            "ABORT HOTKEY": ("ABORT HOTKEY", t.dim),
+            "LOG DIR": ("LOG DIR", t.dim),
         }
         if tag in block_styles:
             label, color = block_styles[tag]
@@ -610,6 +616,7 @@ class ChatApp(App[None]):
         parts = t.split()
         cmd = parts[0].lower()
         args = parts[1:]
+        rest = t[len(parts[0]) :].strip()
 
         if cmd in {"/help", "/menu"}:
             self._append_block(
@@ -617,6 +624,12 @@ class ChatApp(App[None]):
                 "\n".join(
                     [
                         "/help or /menu",
+                        "/workspace [path]",
+                        "/model [name]",
+                        "/max_agent_steps [int]",
+                        "/action_delay [seconds]",
+                        "/abort_hotkey [on|off]",
+                        "/log_dir [path]",
                         "/chat new",
                         "/chat save [name]",
                         "/chat list",
@@ -631,6 +644,80 @@ class ChatApp(App[None]):
                     ]
                 ),
             )
+            return True
+
+        if cmd == "/workspace":
+            if not rest:
+                self._append_block("Workspace", f"Current workspace path: {self._agent.workspace.source_path}")
+                return True
+            try:
+                self._agent.set_workspace(rest)
+                self._append_block("Workspace", f"Workspace set to: {self._agent.workspace.source_path}")
+            except Exception as e:
+                self._append_error(str(e))
+            return True
+
+        if cmd == "/model":
+            if not rest:
+                self._append_block("Model", f"Current model: {self._agent.config.model}")
+                return True
+            try:
+                self._agent.set_model(rest)
+                self._append_block("Model", f"Model set to: {self._agent.config.model}")
+            except Exception as e:
+                self._append_error(str(e))
+            return True
+
+        if cmd in {"/max_agent_steps", "/max-agent-steps"}:
+            if not rest:
+                self._append_block("Max Agent Steps", f"Current max agent steps: {self._agent.config.max_steps}")
+                return True
+            try:
+                self._agent.set_max_steps(int(rest))
+                self._append_block("Max Agent Steps", f"Max agent steps set to: {self._agent.config.max_steps}")
+            except Exception as e:
+                self._append_error(str(e))
+            return True
+
+        if cmd in {"/action_delay", "/action-delay"}:
+            if not rest:
+                self._append_block("Action Delay", f"Current action delay: {self._agent.config.action_delay_s:g} seconds")
+                return True
+            try:
+                self._agent.set_action_delay_s(float(rest))
+                self._append_block("Action Delay", f"Action delay set to: {self._agent.config.action_delay_s:g} seconds")
+            except Exception as e:
+                self._append_error(str(e))
+            return True
+
+        if cmd in {"/abort_hotkey", "/abort-hotkey"}:
+            if not rest:
+                status = "ON" if self._agent.config.abort_hotkey else "OFF"
+                self._append_block("Abort Hotkey", f"The abort hotkey status is currently: {status}.")
+                return True
+            val = rest.strip().lower()
+            truthy = {"1", "true", "on", "yes", "enable", "enabled"}
+            falsy = {"0", "false", "off", "no", "disable", "disabled"}
+            if val not in truthy and val not in falsy:
+                self._append_error("Usage: /abort_hotkey [on|off]")
+                return True
+            try:
+                self._agent.set_abort_hotkey(val in truthy)
+                status = "ON" if self._agent.config.abort_hotkey else "OFF"
+                self._append_block("Abort Hotkey", f"The abort hotkey status is set to be: {status}.")
+            except Exception as e:
+                self._append_error(str(e))
+            return True
+
+        if cmd in {"/log_dir", "/log-dir"}:
+            if not rest:
+                self._append_block("Log Dir", f"Current log dir: {self._agent.config.log_dir}")
+                return True
+            try:
+                self._agent.set_log_dir(rest)
+                self._append_block("Log Dir", f"Log dir set to: {self._agent.config.log_dir}")
+            except Exception as e:
+                self._append_error(str(e))
             return True
 
         if cmd == "/chat":
@@ -684,6 +771,12 @@ class ChatApp(App[None]):
                 if state is None:
                     self._append_error(f"Session not found: {name}")
                     return True
+                st_ws = state.get("workspace", None)
+                if isinstance(st_ws, str) and st_ws.strip():
+                    try:
+                        self._agent.set_workspace(st_ws)
+                    except Exception as e:
+                        self._append_error(f"Failed to load workspace from session: {e}")
                 self._history = [str(state.get("history", ""))]
                 self._render_transcript_full("".join(self._history))
                 agent_state = state.get("agent", {})

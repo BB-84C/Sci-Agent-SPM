@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Callable, Iterable, Mapping, Optional
 
 from .actions import ActionConfig, Actor
@@ -109,6 +109,57 @@ class VisualAutomationAgent:
             self._event_sink({"type": event_type, **payload})
         except Exception:
             pass
+
+    def set_model(self, model: str) -> None:
+        model = model.strip()
+        if not model:
+            raise ValueError("Model name cannot be empty.")
+        self.config = replace(self.config, model=model)
+        try:
+            self.llm._config = replace(self.llm._config, model=model)  # type: ignore[attr-defined]
+        except Exception:
+            self.llm = OpenAiMultimodalClient(LlmConfig(model=model))
+
+    def set_max_steps(self, max_steps: int) -> None:
+        max_steps = int(max_steps)
+        if max_steps <= 0:
+            raise ValueError("max_steps must be > 0.")
+        self.config = replace(self.config, max_steps=max_steps)
+
+    def set_action_delay_s(self, delay_s: float) -> None:
+        delay_s = float(delay_s)
+        if delay_s < 0:
+            raise ValueError("action_delay_s must be >= 0.")
+        self.config = replace(self.config, action_delay_s=delay_s)
+        self.actor.set_delay_s(delay_s)
+
+    def set_abort_hotkey(self, enabled: bool) -> None:
+        enabled = bool(enabled)
+        self.config = replace(self.config, abort_hotkey=enabled)
+
+        if enabled:
+            if self._abort is None:
+                self._abort = start_abort_hotkey()
+                self.actor.set_abort_event(self._abort.event)
+            return
+
+        if self._abort is not None:
+            try:
+                self._abort.stop()
+            finally:
+                self._abort = None
+        self.actor.set_abort_event(None)
+
+    def set_log_dir(self, log_dir: str) -> None:
+        log_dir = log_dir.strip()
+        if not log_dir:
+            raise ValueError("log_dir cannot be empty.")
+        self.config = replace(self.config, log_dir=log_dir)
+        self.logger = RunLogger(root_dir=log_dir)
+
+    def set_workspace(self, workspace_path: str) -> None:
+        ws = load_workspace(workspace_path)
+        self.workspace = ws
 
     def export_session(self) -> Mapping[str, Any]:
         return {

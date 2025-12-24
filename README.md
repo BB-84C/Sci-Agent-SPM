@@ -44,7 +44,7 @@ Tip: Use a screen ruler tool or a quick one-off script to print mouse coordinate
 ## Run
 
 ```powershell
-.\.venv\Scripts\python -m src.main --workspace workspace.json --command "Set the tip bias to 200 mV"
+.\.venv\Scripts\python -m src.main --agent
 ```
 
 ### Agent mode (LLM, multimodal)
@@ -64,14 +64,15 @@ Make sure your current Python has the `openai` package installed (recommended: u
 Run with `--agent` (uses `gpt-5.2` by default):
 
 ```powershell
-.\.venv\Scripts\python -m src.main --agent --workspace workspace.json --command "Set the tip bias from 1 V to 200 mV, then start scan from top"
+.\.venv\Scripts\python -m src.main --agent
 ```
 
-Chat UI (in-terminal):
+In the TUI, settings are controlled via slash commands:
 
-```powershell
-.\.venv\Scripts\python -m src.main --agent --chat --workspace workspace.json
-```
+- `/workspace [path]` (default: `workspace.json`)
+- `/model [name]` (get/set)
+- `/max_agent_steps [int]` (get/set)
+- `/log_dir [path]` (get/set)
 
 Chat commands:
 - `/help` (or `/menu`) shows available commands
@@ -85,20 +86,7 @@ If you add an ROI named `scan_time_count_down` (with a clear description of the 
 
 Abort options:
 - Move mouse to top-left corner (pyautogui failsafe)
-- Press `ESC` (can be disabled with `--no-abort-hotkey`)
-
-Dry run (no mouse/keyboard actions):
-
-```powershell
-.\.venv\Scripts\python -m src.main --workspace workspace.json --command "set bias from 100 mV to 200 mV then start scan" --dry-run
-```
-
-## Supported demo commands (rule-based parser)
-
-- `set bias from <num> (mV|V) to <num> (mV|V)`
-- `set the tip bias to <num> (mV|V)`
-- `start scanning` / `start scan`
-- `start scan from top` / `start scan from bottom`
+- Press `ESC` (toggle in TUI: `/abort_hotkey on|off`)
 
 ## Logs
 
