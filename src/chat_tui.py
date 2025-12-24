@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import threading
 from dataclasses import dataclass
 from datetime import datetime
@@ -83,6 +84,12 @@ def _parse_transcript(text: str) -> list[TranscriptEntry]:
             i += 1
             while i < len(lines) and lines[i].strip() != "":
                 # Continuation of a multi-line message / block.
+                # Stop if a new [TAG] block begins without a blank separator.
+                if lines[i].startswith("[") and "]" in lines[i]:
+                    nxt_close = lines[i].find("]")
+                    nxt_tag = lines[i][1:nxt_close].strip()
+                    if nxt_tag and nxt_tag.replace(" ", "").isupper():
+                        break
                 content_lines.append(lines[i])
                 i += 1
             entries.append(TranscriptEntry(tag=tag, content="\n".join(content_lines).rstrip()))
@@ -191,6 +198,7 @@ class ChatApp(App[None]):
         self._tokens_in: int = 0
         self._tokens_out: int = 0
         self._tokens_total: int = 0
+        self._truncate_tool_blocks: bool = True
 
     class ChatInput(TextArea):
         ALLOW_SELECT = True
@@ -360,10 +368,89 @@ class ChatApp(App[None]):
             transcript.write(self._render_entry(entry))
             transcript.write(Text(""))
 
+    def _display_entries(self, text: str) -> list[TranscriptEntry]:
+        entries = _parse_transcript(text)
+        if not self._truncate_tool_blocks:
+            return entries
+
+        last_response_idx = -1
+        for idx, entry in enumerate(entries):
+            tag = entry.tag.strip().upper()
+            if tag in {"AGENT", "DONE"} and (entry.content or "").strip():
+                last_response_idx = idx
+
+        if last_response_idx < 0:
+            return entries
+
+        def extract_tool_from_tool_call(content: str) -> Optional[str]:
+            for line in (content or "").splitlines():
+                m = re.match(r"\\s*tool\\s*:\\s*(.+?)\\s*$", line, flags=re.IGNORECASE)
+                if m:
+                    return m.group(1).strip() or None
+            try:
+                obj = json.loads(content)
+            except Exception:
+                return None
+            if isinstance(obj, dict):
+                for k in ("tool", "name", "skill", "action"):
+                    v = obj.get(k)
+                    if isinstance(v, str) and v.strip():
+                        return v.strip()
+            return None
+
+        def extract_tool_or_skill_from_result(content: str) -> Optional[tuple[str, str]]:
+            try:
+                obj = json.loads(content)
+            except Exception:
+                return None
+            if not isinstance(obj, dict):
+                return None
+            for k in ("skill", "tool", "name", "action"):
+                v = obj.get(k)
+                if isinstance(v, str) and v.strip():
+                    label = "skill" if k == "skill" else "tool"
+                    return (label, v.strip())
+            return None
+
+        def tool_name_for_result_at(index: int) -> Optional[str]:
+            # Prefer parsing from the result payload itself.
+            payload = extract_tool_or_skill_from_result(entries[index].content or "")
+            if payload is not None:
+                _, name = payload
+                return name
+
+            # Fall back to the nearest previous tool call.
+            for j in range(index - 1, -1, -1):
+                if entries[j].tag.strip().upper() != "TOOL CALL":
+                    continue
+                return extract_tool_from_tool_call(entries[j].content or "")
+            return None
+
+        out: list[TranscriptEntry] = []
+        for idx, entry in enumerate(entries):
+            tag = entry.tag.strip().upper()
+            if idx < last_response_idx and tag in {"TOOL CALL", "TOOL RESULT"}:
+                if tag == "TOOL CALL":
+                    tool = extract_tool_from_tool_call(entry.content or "")
+                    collapsed = f"tool: {tool}" if tool else "tool: (truncated)"
+                    out.append(TranscriptEntry(tag=entry.tag, content=collapsed))
+                else:
+                    payload = extract_tool_or_skill_from_result(entry.content or "")
+                    if payload is not None:
+                        label, name = payload
+                        collapsed = f"{label}: {name}"
+                    else:
+                        tool = tool_name_for_result_at(idx)
+                        collapsed = f"tool: {tool}" if tool else "tool: (truncated)"
+                    out.append(TranscriptEntry(tag=entry.tag, content=collapsed))
+                continue
+            out.append(entry)
+        return out
+
     def _render_transcript_full(self, text: str) -> None:
         transcript = self._transcript()
         transcript.clear()
-        for entry in _parse_transcript(text):
+        for entry in self._display_entries(text):
             transcript.write(self._render_entry(entry))
             transcript.write(Text(""))
 
@@ -432,6 +519,9 @@ class ChatApp(App[None]):
 
         # Fallback: show untagged lines without extra styling.
         return Text(content, style=t.fg)
+
+    def _rerender_transcript_from_history(self) -> None:
+        self._render_transcript_full("".join(self._history))
 
     def action_focus_transcript(self) -> None:
         self._transcript().focus()
@@ -651,6 +741,7 @@ class ChatApp(App[None]):
             say = str(ev.get("say", "")).strip()
             if say:
                 self._append_agent(say)
+                self._rerender_transcript_from_history()
             plan = ev.get("plan", None)
             if isinstance(plan, list) and plan:
                 self._append_block("Plan", "\n".join(f"- {x}" for x in plan))
@@ -678,6 +769,7 @@ class ChatApp(App[None]):
             return
         if t == "finish":
             self._append_block("Done", str(ev.get("say", "Finished.")))
+            self._rerender_transcript_from_history()
             return
 
 
