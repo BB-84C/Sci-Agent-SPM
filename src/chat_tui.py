@@ -14,6 +14,7 @@ from textual.binding import Binding
 from textual.containers import Container, Horizontal
 from textual.message import Message
 from textual.reactive import reactive
+from textual.screen import ModalScreen
 from textual.widgets import Footer, RichLog, Static, TextArea
 
 from rich.text import Text
@@ -181,6 +182,7 @@ class ChatApp(App[None]):
         ("ctrl+q", "quit", "Quit"),
         ("ctrl+l", "focus_transcript", "Log"),
         ("ctrl+i", "focus_input", "Input"),
+        ("ctrl+shift+c", "copy_mode", "Select/Copy"),
         ("pageup", "scroll_up", "Up"),
         ("pagedown", "scroll_down", "Down"),
     ]
@@ -240,6 +242,56 @@ class ChatApp(App[None]):
                 app.copy_to_clipboard(getattr(app, "_get_transcript_plain_text")())
             except Exception:
                 pass
+
+    class TranscriptCopyScreen(ModalScreen[None]):
+        CSS = """
+        TranscriptCopyScreen {
+            background: rgba(0, 0, 0, 85%);
+        }
+        #copy_root {
+            width: 90%;
+            height: 85%;
+            margin: 2 5;
+            border: round #26E476;
+            background: #0C0C0C;
+        }
+        #copy_area {
+            width: 100%;
+            height: 1fr;
+            background: #0C0C0C;
+            color: #26E476;
+            border: none;
+            padding: 1 2;
+        }
+        #copy_hint {
+            height: 1;
+            padding: 0 2;
+            color: #1DB45E;
+            background: #0C0C0C;
+        }
+        """
+
+        BINDINGS = [
+            Binding("escape", "dismiss", "Close", show=True, priority=True),
+        ]
+
+        def __init__(self, *, text: str) -> None:
+            super().__init__()
+            self._text = text
+
+        def compose(self) -> ComposeResult:
+            with Container(id="copy_root"):
+                ta = TextArea(self._text, id="copy_area")
+                ta.soft_wrap = True
+                ta.show_line_numbers = False
+                ta.show_horizontal_scrollbar = True
+                ta.show_vertical_scrollbar = True
+                ta.read_only = True
+                yield ta
+                yield Static("Select text with mouse/keys, Ctrl+C to copy, Esc to close.", id="copy_hint")
+
+        def on_mount(self) -> None:
+            self.query_one("#copy_area", TextArea).focus()
 
     def compose(self) -> ComposeResult:
         with Container(id="root"):
@@ -528,6 +580,9 @@ class ChatApp(App[None]):
 
     def action_focus_input(self) -> None:
         self._input().focus()
+
+    def action_copy_mode(self) -> None:
+        self.push_screen(self.TranscriptCopyScreen(text=self._get_transcript_plain_text()))
 
     def action_scroll_up(self) -> None:
         self._transcript().scroll_up()
