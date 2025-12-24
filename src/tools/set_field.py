@@ -6,6 +6,21 @@ if TYPE_CHECKING:
     from ..agent import VisualAutomationAgent
 
 
+def _clear_focused_field(agent: "VisualAutomationAgent", anchor: Any) -> None:
+    actor = agent.actor
+    # Robust field clearing: different apps/controls support different selection semantics.
+    actor.double_click(anchor)          # focus / often selects a token
+    actor.hotkey("ctrl", "a")           # try select-all
+    actor.press("delete")               # clear selection
+    actor.hotkey("ctrl", "a")           # repeat (some controls need it after focus)
+    actor.press("backspace")            # clear selection
+    actor.press("home")                 # fallback selection: start…
+    actor.hotkey("shift", "end")        # …to end
+    actor.press("delete")               # clear
+    actor.hotkey("ctrl", "a")           # final sweep
+    actor.press("backspace")
+
+
 def handle(
     agent: "VisualAutomationAgent",
     *,
@@ -34,16 +49,12 @@ def handle(
     for roi_name, _desc, img in before_imgs:
         step.save_image(f"before_{roi_name}.png", img)
 
-    actor = agent.actor
-    actor.double_click(anchor)
-    actor.hotkey("ctrl", "a")
-    actor.press("backspace")
-    actor.press("backspace")
-    actor.type_text(typed_text)
+    _clear_focused_field(agent, anchor)
+    agent.actor.type_text(typed_text)
     if submit_key in {"enter", "return"}:
-        actor.press("enter")
+        agent.actor.press("enter")
     elif submit_key in {"tab"}:
-        actor.press("tab")
+        agent.actor.press("tab")
 
     after_imgs = agent._observe_images(roi_names)
     for roi_name, _desc, img in after_imgs:

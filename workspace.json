@@ -54,7 +54,7 @@
       "name": "bias_input",
       "x": 652,
       "y": 319,
-      "description": "Click target inside the bias input box.",
+      "description": "Anchor point of bias input box. Remember the unit \"V\" embedded in the box is not part of the input value. For example, if you need to input 700mV, return either \"0.7\" or \"700m\".",
       "tags": [
         "input",
         "bias"
@@ -84,12 +84,36 @@
       "name": "current_input",
       "x": 79,
       "y": 822,
-      "description": "Click target inside the current input box.",
+      "description": "Anchor point of current input box. Remember the unit \"A\" embedded in the box is not part of the input value. For example, if you need to input 50pA, return either \"0.000000000005\" or \"50p\" the cap of this input is 10nA.",
       "tags": [
         "input",
         "current"
       ]
     }
   ],
-  "tools": {}
+  "tools": {
+    "SetBias": {
+      "requires_rois": [
+        "bias_readout"
+      ],
+      "requires_anchors": [
+        "bias_input"
+      ],
+      "input_unit": "V",
+      "safety": {
+        "min_mV": -5000,
+        "max_mV": 5000,
+        "tolerance_mV": 2
+      }
+    },
+    "StartScan": {
+      "requires_rois": [
+        "scan_status"
+      ],
+      "requires_anchors": [
+        "scan_start_from_top_button",
+        "scan_start_from_bottom_button"
+      ]
+    }
+  }
 }

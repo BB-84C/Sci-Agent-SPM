@@ -15,7 +15,7 @@ from .tools.fail import handle as tool_fail
 from .tools.finish import handle as tool_finish
 from .tools.launch_calibrator import handle as tool_launch_calibrator
 from .tools.observe import handle as tool_observe
-from .tools.wait import handle as tool_wait
+from .tools.wait_until import handle as tool_wait_until
 from .tools.set_field import handle as tool_set_field
 from .workspace import Workspace, load_workspace
 
@@ -29,7 +29,7 @@ You operate in ReAct style:
 - After each action, you will get a new observation.
 
 Return ONLY JSON with keys:
-  - "action": one of ["observe","wait","click_anchor","set_field","launch_calibrator","finish","fail"]
+  - "action": one of ["observe","wait_until","click_anchor","set_field","launch_calibrator","finish","fail"]
   - "action_input": object with parameters for the action
   - "say": short, demo-friendly narration (1-2 sentences, no internal reasoning)
 Optional keys (keep short):
@@ -49,8 +49,8 @@ IMPORTANT:
   - {"anchor": "<anchor_name>", "typed_text": "<text>", "submit": "enter"|"tab"|null, "rois": ["roi1","roi2"] }
   - You should choose anchor/roi names from the workspace lists in OBSERVATION.
 - If a requested action requires an anchor that does not exist, choose launch_calibrator (not fail).
- - For wait, provide:
-  - {"seconds": <number>} (required; how long to wait)
+ - For wait_until, provide:
+  - {"roi": "<roi_name>", "seconds": <int>, "max_rounds": <int optional>, "max_total_seconds": <int optional>, "reason": "<string optional>"}
 """
 
 
@@ -254,7 +254,7 @@ class VisualAutomationAgent:
                 rationale = str(model_out.get("rationale", "")).strip() if "rationale" in model_out else ""
 
                 signature = None
-                if action in {"wait", "click_anchor", "set_field", "launch_calibrator"}:
+                if action in {"wait_until", "click_anchor", "set_field", "launch_calibrator"}:
                     try:
                         items = sorted((str(k), str(v)) for k, v in action_input.items())
                         signature = f"{action}:{items}"
@@ -298,8 +298,8 @@ class VisualAutomationAgent:
                         break
                     continue
 
-                if action == "wait":
-                    tool_wait(
+                if action == "wait_until":
+                    tool_wait_until(
                         self,
                         step_index=i,
                         action_input=action_input,
