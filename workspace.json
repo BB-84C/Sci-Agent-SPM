@@ -1,0 +1,119 @@
+{
+  "rois": [
+    {
+      "name": "bias_readout",
+      "x": 11,
+      "y": 212,
+      "w": 721,
+      "h": 150,
+      "description": "ROI covering the displayed bias value (V) in Nanonis.",
+      "tags": [
+        "readout",
+        "bias"
+      ]
+    },
+    {
+      "name": "scan_status",
+      "x": 2855,
+      "y": 51,
+      "w": 63,
+      "h": 56,
+      "description": "ROI covering scan status. It's an icon made of 2 balck bars. If the Icon is in balck, then it means the scanning is in progress. If the icon is in balck and has a squre gray shadow background, then it means the scanning is on paused. If the icon is in faded gray color, it means there's now scaning in progress.",
+      "tags": [
+        "status",
+        "scan"
+      ]
+    },
+    {
+      "name": "current_readout",
+      "x": 18,
+      "y": 758,
+      "w": 704,
+      "h": 100,
+      "description": "ROI covering the displayed current value (A) in Nanonis.",
+      "tags": [
+        "readout",
+        "current"
+      ]
+    },
+    {
+      "name": "scan_time_countdown_readout",
+      "x": 3425,
+      "y": 153,
+      "w": 239,
+      "h": 87,
+      "description": "The scan time count down indicated the time that current scan needs to finish.",
+      "tags": [
+        "readout",
+        "scan_time_countdown"
+      ]
+    }
+  ],
+  "anchors": [
+    {
+      "name": "bias_input",
+      "x": 652,
+      "y": 319,
+      "description": "Click target inside the bias input box.",
+      "tags": [
+        "input",
+        "bias"
+      ]
+    },
+    {
+      "name": "scan_start_from_top_button",
+      "x": 2728,
+      "y": 76,
+      "description": "Click target on the Start Scan From Top button.",
+      "tags": [
+        "button",
+        "scan from top"
+      ]
+    },
+    {
+      "name": "scan_start_from_bottom_button",
+      "x": 2679,
+      "y": 81,
+      "description": "Click target on the Start Scan From bottom button.",
+      "tags": [
+        "button",
+        "scan from bottom"
+      ]
+    },
+    {
+      "name": "current_input",
+      "x": 79,
+      "y": 822,
+      "description": "Click target inside the current input box.",
+      "tags": [
+        "input",
+        "current"
+      ]
+    }
+  ],
+  "tools": {
+    "SetBias": {
+      "requires_rois": [
+        "bias_readout"
+      ],
+      "requires_anchors": [
+        "bias_input"
+      ],
+      "input_unit": "V",
+      "safety": {
+        "min_mV": -5000,
+        "max_mV": 5000,
+        "tolerance_mV": 2
+      }
+    },
+    "StartScan": {
+      "requires_rois": [
+        "scan_status"
+      ],
+      "requires_anchors": [
+        "scan_start_from_top_button",
+        "scan_start_from_bottom_button"
+      ]
+    }
+  }
+}

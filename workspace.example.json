@@ -1,0 +1,70 @@
+{
+  "rois": [
+    {
+      "name": "bias_readout",
+      "x": 100,
+      "y": 100,
+      "w": 180,
+      "h": 40,
+      "description": "ROI covering the displayed bias value (mV) in Nanonis.",
+      "tags": ["readout", "bias"]
+    },
+    {
+      "name": "scan_status",
+      "x": 100,
+      "y": 200,
+      "w": 300,
+      "h": 120,
+      "description": "ROI covering scan status / control panel area (for before/after screenshots).",
+      "tags": ["status", "scan"]
+    },
+    {
+      "name": "scan_time_count_down",
+      "x": 100,
+      "y": 340,
+      "w": 220,
+      "h": 40,
+      "description": "ROI showing remaining scan time (countdown). Example formats: 00:12:34 or 12:34 or '12 s'.",
+      "tags": ["status", "scan", "countdown", "time"]
+    }
+  ],
+  "anchors": [
+    {
+      "name": "bias_input",
+      "x": 250,
+      "y": 120,
+      "description": "Click target inside the bias input box.",
+      "tags": ["input", "bias"]
+    },
+    {
+      "name": "scan_start_from_top_button",
+      "x": 180,
+      "y": 260,
+      "description": "Click target on the Start Scan From Top button.",
+      "tags": ["button", "scan", "from top"]
+    },
+    {
+      "name": "scan_start_from_bottom_button",
+      "x": 200,
+      "y": 260,
+      "description": "Click target on the Start Scan From Bottom button.",
+      "tags": ["button", "scan", "from bottom"]
+    }
+  ],
+  "tools": {
+    "SetBias": {
+      "requires_rois": ["bias_readout"],
+      "requires_anchors": ["bias_input"],
+      "input_unit": "V",
+      "safety": {
+        "min_mV": -5000,
+        "max_mV": 5000,
+        "tolerance_mV": 2
+      }
+    },
+    "StartScan": {
+      "requires_rois": ["scan_status"],
+      "requires_anchors": ["scan_start_from_top_button", "scan_start_from_bottom_button"]
+    }
+  }
+}
