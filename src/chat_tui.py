@@ -13,7 +13,9 @@ from textual.binding import Binding
 from textual.containers import Container, Horizontal
 from textual.message import Message
 from textual.reactive import reactive
-from textual.widgets import Footer, Static, TextArea
+from textual.widgets import Footer, RichLog, Static, TextArea
+
+from rich.text import Text
 
 from .agent import VisualAutomationAgent
 from .session_store import list_sessions, load_session, save_session
@@ -29,6 +31,66 @@ class Theme:
     agent: str = "#B4009E"
     accent: str = "#3B78FF"
     error: str = "#E74856"
+
+    def mix(self, other: str, alpha: float) -> str:
+        """Mix `other` into `bg` by alpha (0..1)."""
+
+        def clamp01(x: float) -> float:
+            return 0.0 if x < 0.0 else 1.0 if x > 1.0 else x
+
+        alpha = clamp01(alpha)
+
+        def parse_hex(c: str) -> tuple[int, int, int]:
+            c = c.lstrip("#")
+            return (int(c[0:2], 16), int(c[2:4], 16), int(c[4:6], 16))
+
+        def to_hex(rgb: tuple[int, int, int]) -> str:
+            r, g, b = rgb
+            return f"#{r:02X}{g:02X}{b:02X}"
+
+        r0, g0, b0 = parse_hex(self.bg)
+        r1, g1, b1 = parse_hex(other)
+        r = round(r0 * (1.0 - alpha) + r1 * alpha)
+        g = round(g0 * (1.0 - alpha) + g1 * alpha)
+        b = round(b0 * (1.0 - alpha) + b1 * alpha)
+        return to_hex((r, g, b))
+
+
+@dataclass(frozen=True, slots=True)
+class TranscriptEntry:
+    tag: str
+    content: str
+
+
+def _parse_transcript(text: str) -> list[TranscriptEntry]:
+    entries: list[TranscriptEntry] = []
+    lines = text.splitlines()
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if not line.strip():
+            i += 1
+            continue
+        if line.startswith("[") and "]" in line:
+            close = line.find("]")
+            tag = line[1:close].strip()
+            rest = line[close + 1 :]
+            if rest.startswith(" "):
+                rest = rest[1:]
+            content_lines: list[str] = []
+            if rest:
+                content_lines.append(rest)
+            i += 1
+            while i < len(lines) and lines[i].strip() != "":
+                # Continuation of a multi-line message / block.
+                content_lines.append(lines[i])
+                i += 1
+            entries.append(TranscriptEntry(tag=tag, content="\n".join(content_lines).rstrip()))
+            continue
+
+        entries.append(TranscriptEntry(tag="TEXT", content=line.rstrip()))
+        i += 1
+    return entries
 
 
 class AgentEvent(Message):
@@ -157,19 +219,23 @@ class ChatApp(App[None]):
                 return
             await super()._on_key(event)
 
-    class Transcript(TextArea):
-        ALLOW_SELECT = True
+    class Transcript(RichLog):
         BINDINGS = [
-            Binding("ctrl+a", "select_all", "Select all", show=False, priority=True),
-            Binding("ctrl+c", "copy", "Copy", show=False, priority=True),
+            Binding("ctrl+c", "copy_transcript", "Copy transcript", show=False, priority=True),
         ]
+
+        def action_copy_transcript(self) -> None:
+            app = getattr(self, "app", None)
+            if app is None:
+                return
+            try:
+                app.copy_to_clipboard(getattr(app, "_get_transcript_plain_text")())
+            except Exception:
+                pass
 
     def compose(self) -> ComposeResult:
         with Container(id="root"):
-            transcript = self.Transcript("", id="transcript")
-            transcript.read_only = True
-            transcript.soft_wrap = True
-            transcript.show_line_numbers = False
+            transcript = self.Transcript(id="transcript", wrap=True, markup=False, highlight=False)
             yield transcript
 
             yield Static("", id="status")
@@ -228,8 +294,8 @@ class ChatApp(App[None]):
             pass
         self._set_tokens(input_tokens=0, output_tokens=0, total_tokens=0)
 
-    def _transcript(self) -> TextArea:
-        return self.query_one("#transcript", TextArea)
+    def _transcript(self) -> RichLog:
+        return self.query_one("#transcript", RichLog)
 
     def _input(self) -> TextArea:
         return self.query_one("#input", TextArea)
@@ -268,9 +334,7 @@ class ChatApp(App[None]):
 
     def _append_raw(self, text: str) -> None:
         self._history.append(text)
-        transcript = self._transcript()
-        transcript.text = "".join(self._history)
-        transcript.scroll_end(animate=False)
+        self._render_transcript_chunk(text)
 
     def _append_system(self, text: str) -> None:
         self._append_raw(f"[SYSTEM] {text}\n\n")
@@ -279,13 +343,95 @@ class ChatApp(App[None]):
         self._append_raw(f"[YOU] {text}\n\n")
 
     def _append_agent(self, text: str) -> None:
-        self._append_raw(f"[AGENT] {text}\n")
+        self._append_raw(f"[AGENT] {text}\n\n")
 
     def _append_block(self, title: str, content: str) -> None:
         self._append_raw(f"[{title.upper()}]\n{content}\n\n")
 
     def _append_error(self, text: str) -> None:
         self._append_raw(f"[ERROR] {text}\n\n")
+
+    def _get_transcript_plain_text(self) -> str:
+        return "".join(self._history)
+
+    def _render_transcript_chunk(self, chunk: str) -> None:
+        transcript = self._transcript()
+        for entry in _parse_transcript(chunk):
+            transcript.write(self._render_entry(entry))
+            transcript.write(Text(""))
+
+    def _render_transcript_full(self, text: str) -> None:
+        transcript = self._transcript()
+        transcript.clear()
+        for entry in _parse_transcript(text):
+            transcript.write(self._render_entry(entry))
+            transcript.write(Text(""))
+
+    def _render_entry(self, entry: TranscriptEntry) -> Text:
+        t = self._theme
+        tag = entry.tag.strip().upper()
+        content = entry.content or ""
+
+        def chip(label: str, color: str) -> Text:
+            return Text(f" {label} ", style=f"bold {t.bg} on {color}")
+
+        def box_title(label: str, color: str) -> Text:
+            return Text(f" {label} ", style=f"bold {t.bg} on {color}")
+
+        if tag == "YOU":
+            msg_bg = t.mix(t.user, 0.10)
+            msg = Text()
+            msg.append_text(chip("YOU", t.user))
+            msg.append(" ")
+            msg.append(content, style=f"{t.user} on {msg_bg}")
+            return msg
+
+        if tag == "AGENT":
+            msg_bg = t.mix(t.agent, 0.10)
+            msg = Text()
+            msg.append_text(chip("AGENT", t.agent))
+            msg.append(" ")
+            msg.append(content, style=f"{t.fg} on {msg_bg}")
+            return msg
+
+        if tag == "SYSTEM":
+            msg_bg = t.mix(t.dim, 0.08)
+            msg = Text()
+            msg.append_text(chip("SYSTEM", t.dim))
+            msg.append(" ")
+            msg.append(content, style=f"{t.dim} on {msg_bg}")
+            return msg
+
+        if tag == "ERROR":
+            msg_bg = t.mix(t.error, 0.08)
+            msg = Text()
+            msg.append_text(chip("ERROR", t.error))
+            msg.append(" ")
+            msg.append(content, style=f"{t.error} on {msg_bg}")
+            return msg
+
+        block_styles: dict[str, tuple[str, str]] = {
+            "PLAN": ("PLAN", t.accent),
+            "OBSERVATION": ("OBSERVATION", t.dim),
+            "THOUGHT": ("THOUGHT", t.agent),
+            "TOOL CALL": ("TOOL CALL", t.accent),
+            "TOOL RESULT": ("TOOL RESULT", t.user),
+            "DONE": ("DONE", t.fg),
+            "SESSIONS": ("SESSIONS", t.user),
+            "HELP": ("HELP", t.dim),
+            "CONFIRM": ("CONFIRM", t.accent),
+        }
+        if tag in block_styles:
+            label, color = block_styles[tag]
+            body_bg = t.mix(color, 0.08)
+            out = Text()
+            out.append_text(box_title(label, color))
+            out.append("\n")
+            out.append(content, style=f"{t.fg} on {body_bg}")
+            return out
+
+        # Fallback: show untagged lines without extra styling.
+        return Text(content, style=t.fg)
 
     def action_focus_transcript(self) -> None:
         self._transcript().focus()
@@ -394,7 +540,7 @@ class ChatApp(App[None]):
                     self._append_error(f"Session not found: {name}")
                     return True
                 self._history = [str(state.get("history", ""))]
-                self._transcript().text = "".join(self._history)
+                self._render_transcript_full("".join(self._history))
                 agent_state = state.get("agent", {})
                 if isinstance(agent_state, dict):
                     self._agent.import_session(agent_state)
@@ -435,7 +581,7 @@ class ChatApp(App[None]):
                 self._confirm_mode = None
                 # Clear transcript + reset agent memory, without saving.
                 self._history = []
-                self._transcript().text = ""
+                self._transcript().clear()
                 try:
                     self._agent.import_session(
                         {
