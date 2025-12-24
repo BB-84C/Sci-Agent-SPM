@@ -116,16 +116,12 @@ Example console output:
 
 ```text
 Plan:
-  1. SetBias(target_mV=200.0)
-  2. StartScan()
+  1. Use `--agent` mode to set a field and click anchors.
 Workspace: workspace.json
 Dry-run: False
 Failsafe: move mouse to top-left to abort (pyautogui.FAILSAFE)
 Abort hotkey: ESC
-[SetBias] Attempt 1/3: set bias to 200 mV
-[StartScan] Clicking Start Scan…
-[StartScan] Clicking Start Scan…
-[StartScan] Started (unverified); saved before/after screenshots.
+[Agent] Use `set_field`/`click_anchor` actions with anchors from your workspace.
 Logs: logs/20251223_143012
 ```
 

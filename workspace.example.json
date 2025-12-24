@@ -51,20 +51,5 @@
       "tags": ["button", "scan", "from bottom"]
     }
   ],
-  "tools": {
-    "SetBias": {
-      "requires_rois": ["bias_readout"],
-      "requires_anchors": ["bias_input"],
-      "input_unit": "V",
-      "safety": {
-        "min_mV": -5000,
-        "max_mV": 5000,
-        "tolerance_mV": 2
-      }
-    },
-    "StartScan": {
-      "requires_rois": ["scan_status"],
-      "requires_anchors": ["scan_start_from_top_button", "scan_start_from_bottom_button"]
-    }
-  }
+  "tools": {}
 }

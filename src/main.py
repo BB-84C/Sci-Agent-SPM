@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import re
 import sys
 from dataclasses import dataclass
 from typing import Any, Iterable, List, Mapping, Optional
@@ -10,8 +9,6 @@ from .actions import ActionConfig, Actor
 from .abort import start_abort_hotkey
 from .capture import ScreenCapturer
 from .logger import RunLogger
-from .skills.set_bias import SetBiasParams
-from .skills.start_scan import StartScanParams
 from .workspace import Workspace, load_workspace
 
 
@@ -21,50 +18,8 @@ class PlanStep:
     args: Mapping[str, Any]
 
 
-_SET_BIAS_TO_RE = re.compile(r"\bset\b.*\bbias\b.*\bto\b\s*(-?\d+(?:\.\d+)?)\s*(m?v)\b", re.IGNORECASE)
-_SET_BIAS_FROM_TO_RE = re.compile(
-    r"\bset\b.*\bbias\b.*\bfrom\b\s*(-?\d+(?:\.\d+)?)\s*(m?v)\b.*\bto\b\s*(-?\d+(?:\.\d+)?)\s*(m?v)\b",
-    re.IGNORECASE,
-)
-_START_SCAN_RE = re.compile(r"\b(start scanning|start scan)\b", re.IGNORECASE)
-_SCAN_FROM_TOP_RE = re.compile(r"\b(from top|top)\b", re.IGNORECASE)
-_SCAN_FROM_BOTTOM_RE = re.compile(r"\b(from bottom|bottom)\b", re.IGNORECASE)
-
-
 def parse_command(command: str) -> list[PlanStep]:
-    cmd = " ".join(command.strip().split())
-    steps: list[PlanStep] = []
-
-    m = _SET_BIAS_FROM_TO_RE.search(cmd)
-    if m:
-        target_value = float(m.group(3))
-        unit = m.group(4)
-        unit = "V" if unit.lower() == "v" else "mV"
-        steps.append(PlanStep(name="SetBias", args={"target_value": target_value, "target_unit": unit}))
-    else:
-        m2 = _SET_BIAS_TO_RE.search(cmd)
-        if m2:
-            target_value = float(m2.group(1))
-            unit = m2.group(2)
-            unit = "V" if unit.lower() == "v" else "mV"
-            steps.append(PlanStep(name="SetBias", args={"target_value": target_value, "target_unit": unit}))
-
-    if _START_SCAN_RE.search(cmd):
-        direction = "default"
-        if _SCAN_FROM_TOP_RE.search(cmd) and not _SCAN_FROM_BOTTOM_RE.search(cmd):
-            direction = "top"
-        elif _SCAN_FROM_BOTTOM_RE.search(cmd) and not _SCAN_FROM_TOP_RE.search(cmd):
-            direction = "bottom"
-        steps.append(PlanStep(name="StartScan", args={"direction": direction}))
-
-    if not steps:
-        raise ValueError(
-            "Could not parse command. Try: "
-            "'set the tip bias to 200 mV', "
-            "'set bias from 100 mV to 200 mV', "
-            "'start scan'."
-        )
-    return steps
+    raise ValueError("Non-agent plan mode has been removed. Use `--agent` (optionally with `--chat`).")
 
 
 def _print_plan(steps: Iterable[PlanStep]) -> None:
@@ -102,41 +57,7 @@ def run_plan(
 
     results: list[Mapping[str, Any]] = []
     try:
-        for step in steps:
-            if step.name == "SetBias":
-                params = SetBiasParams(
-                    target_value=float(step.args["target_value"]),
-                    target_unit=str(step.args.get("target_unit", "mV")),  # type: ignore[arg-type]
-                )
-                from .skills.set_bias import run as run_set_bias
-
-                results.append(
-                    run_set_bias(
-                        workspace=workspace,
-                        capturer=capturer,
-                        actor=actor,
-                        logger=logger,
-                        params=params,
-                    )
-                )
-            elif step.name == "StartScan":
-                direction = str(step.args.get("direction", "default")).lower()
-                if direction not in {"top", "bottom", "default"}:
-                    direction = "default"
-                params = StartScanParams(direction=direction)  # type: ignore[arg-type]
-                from .skills.start_scan import run as run_start_scan
-
-                results.append(
-                    run_start_scan(
-                        workspace=workspace,
-                        capturer=capturer,
-                        actor=actor,
-                        logger=logger,
-                        params=params,
-                    )
-                )
-            else:
-                raise ValueError(f"Unknown step: {step.name}")
+        raise ValueError("Non-agent plan mode has been removed. Use `--agent` (optionally with `--chat`).")
     finally:
         if abort is not None:
             abort.stop()
