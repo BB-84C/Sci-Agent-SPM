@@ -15,8 +15,7 @@ class ActionConfig:
 
 
 class Actor:
-    def __init__(self, *, dry_run: bool, config: ActionConfig, abort_event: Event | None = None) -> None:
-        self._dry_run = dry_run
+    def __init__(self, *, config: ActionConfig, abort_event: Event | None = None) -> None:
         self._config = config
         self._abort_event = abort_event
 
@@ -42,37 +41,27 @@ class Actor:
 
     def click(self, anchor: Anchor) -> None:
         self._check_abort()
-        if self._dry_run:
-            return
         x, y = anchor.as_point()
         pyautogui.click(x=x, y=y)
         self.sleep()
 
     def double_click(self, anchor: Anchor) -> None:
         self._check_abort()
-        if self._dry_run:
-            return
         x, y = anchor.as_point()
         pyautogui.doubleClick(x=x, y=y, interval=0.05)
         self.sleep()
 
     def hotkey(self, *keys: str) -> None:
         self._check_abort()
-        if self._dry_run:
-            return
         pyautogui.hotkey(*keys)
         self.sleep()
 
     def press(self, key: str) -> None:
         self._check_abort()
-        if self._dry_run:
-            return
         pyautogui.press(key)
         self.sleep()
 
     def type_text(self, text: str) -> None:
         self._check_abort()
-        if self._dry_run:
-            return
         pyautogui.write(text, interval=0.01)
         self.sleep()

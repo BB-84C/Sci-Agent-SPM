@@ -27,7 +27,6 @@ def main(argv: Optional[list[str]] = None) -> int:
         agent = VisualAutomationAgent(
             workspace=workspace,
             config=AgentConfig(),
-            dry_run=False,
         )
         return run_chat_tui(agent=agent, first_message=None)
     except KeyboardInterrupt:

@@ -70,13 +70,11 @@ class VisualAutomationAgent:
         *,
         workspace: Workspace,
         config: AgentConfig,
-        dry_run: bool,
         event_sink: Optional[Callable[[Mapping[str, Any]], None]] = None,
         logger: Optional[RunLogger] = None,
     ) -> None:
         self.workspace = workspace
         self.config = config
-        self.dry_run = dry_run
 
         self.logger = logger or RunLogger(root_dir=config.log_dir)
         self.capturer = ScreenCapturer()
@@ -85,7 +83,6 @@ class VisualAutomationAgent:
         abort = start_abort_hotkey() if config.abort_hotkey else None
         self._abort = abort
         self.actor = Actor(
-            dry_run=dry_run,
             config=ActionConfig(delay_s=config.action_delay_s),
             abort_event=abort.event if abort else None,
         )
@@ -271,7 +268,6 @@ class VisualAutomationAgent:
             pass
         self.logger.narrate(f"Workspace: {self.workspace.source_path}")
         self.logger.narrate(f"Agent mode: True (model={self.config.model})")
-        self.logger.narrate(f"Dry-run: {self.dry_run}")
         self.logger.narrate("Failsafe: move mouse to top-left to abort (pyautogui.FAILSAFE)")
         if self.config.abort_hotkey:
             self.logger.narrate("Abort hotkey: ESC")

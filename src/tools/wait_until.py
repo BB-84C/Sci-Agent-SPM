@@ -153,7 +153,7 @@ def handle(
         roi = agent.workspace.roi(roi_name)
     except KeyError as e:
         step = agent.logger.start_step(f"wait_until_{roi_name}_invalid")
-        meta = {"tool": "wait_until", "reason": "invalid_roi", "roi": roi_name, "error": str(e), "dry_run": agent.dry_run}
+        meta = {"tool": "wait_until", "reason": "invalid_roi", "roi": roi_name, "error": str(e)}
         step.write_meta(meta)
         result = {"reason": "wait_until_invalid_roi", "roi": roi_name, "log_root": str(agent.logger.run_root)}
         results.append({"action": "wait_until", "action_input": dict(action_input), "result": result, "say": say})
@@ -183,9 +183,8 @@ def handle(
 
         if sleep_s > 0:
             agent.logger.narrate(f"[WaitUntil] Round {r}/{max_rounds}: waiting {sleep_s:.1f}s…")
-            if not agent.dry_run:
-                time.sleep(sleep_s)
-                total_waited += sleep_s
+            time.sleep(sleep_s)
+            total_waited += sleep_s
         else:
             agent.logger.narrate(f"[WaitUntil] Round {r}/{max_rounds}: checking now…")
 
@@ -214,10 +213,9 @@ def handle(
             "round": r,
             "max_rounds": max_rounds,
             "requested_seconds": float(seconds),
-            "slept_seconds": float(sleep_s) if not agent.dry_run else 0.0,
+            "slept_seconds": float(sleep_s),
             "total_waited_seconds": float(total_waited),
             "max_total_seconds": float(max_total_seconds),
-            "dry_run": agent.dry_run,
             "reason": wait_reason,
             "image": img_name,
         }
@@ -273,4 +271,3 @@ def handle(
     results.append({"action": "wait_until", "action_input": dict(action_input), "result": fail_result, "say": say})
     agent._emit("result", step=step_index, action="wait_until", result=fail_result)
     return "continue"
-
