@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import json
 import re
 import threading
@@ -194,13 +195,90 @@ class ChatApp(App[None]):
         self._agent = agent
         self._first_message = first_message.strip() if first_message else None
         self._theme = Theme()
-        self._history: list[str] = []
+        self._history_display: list[str] = []
+        self._history_full: list[str] = []
+        self._history_entries: list[dict[str, Any]] = []
         self._events: list[Mapping[str, Any]] = []
         self._confirm_mode: Optional[str] = None
         self._tokens_in: int = 0
         self._tokens_out: int = 0
         self._tokens_total: int = 0
-        self._truncate_tool_blocks: bool = True
+        # Show full tool call/result payloads in the transcript (no truncation/collapse).
+        self._truncate_tool_blocks: bool = False
+        self._temp_session_path = Path("sessions") / ".temp_session.json"
+
+    def on_unmount(self) -> None:
+        self._clear_temp_session()
+
+    def _clear_temp_session(self) -> None:
+        try:
+            if self._temp_session_path.exists():
+                self._temp_session_path.unlink()
+        except Exception:
+            pass
+
+    def _format_ts_short(self, ts_iso: str) -> str:
+        try:
+            dt = datetime.fromisoformat(ts_iso)
+            return dt.strftime("%H:%M:%S")
+        except Exception:
+            return ts_iso
+
+    def _serialize_history_items(self, items: list[dict[str, Any]]) -> str:
+        chunks: list[str] = []
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            tag = it.get("tag", None)
+            content = it.get("content", None)
+            ts = it.get("ts", None)
+            if not isinstance(tag, str) or not isinstance(content, str):
+                continue
+            ts_short = self._format_ts_short(ts) if isinstance(ts, str) and ts.strip() else ""
+            tag_u = tag.strip().upper()
+            if tag_u in {"YOU", "AGENT", "SYSTEM", "ERROR"}:
+                prefix = f"[{tag_u}]"
+                if ts_short:
+                    prefix = f"{prefix} {ts_short}"
+                chunks.append(f"{prefix} {content}\n\n")
+            else:
+                header = f"[{tag_u}]"
+                if ts_short:
+                    header = f"{header} {ts_short}"
+                chunks.append(f"{header}\n{content}\n\n")
+        return "".join(chunks)
+
+    def _append_entry(self, *, tag: str, content: str, block: bool) -> None:
+        ts_iso = datetime.now().isoformat(timespec="seconds")
+        ts_short = self._format_ts_short(ts_iso)
+        tag_u = tag.strip().upper()
+        self._history_entries.append({"ts": ts_iso, "tag": tag_u, "content": content})
+        if tag_u in {"YOU", "AGENT", "SYSTEM", "ERROR"}:
+            self._append_raw(f"[{tag_u}] {ts_short} {content}\n\n")
+            return
+        if block:
+            self._append_raw(f"[{tag_u}] {ts_short}\n{content}\n\n")
+        else:
+            self._append_raw(f"[{tag_u}] {ts_short} {content}\n\n")
+
+    def _write_temp_session(self) -> None:
+        try:
+            self._temp_session_path.parent.mkdir(parents=True, exist_ok=True)
+            history_text = "".join(self._history_full)
+            agent_state = self._agent.export_session()
+            entries = list(self._history_entries)
+            state = {
+                "name": "__temp__",
+                "workspace": str(self._agent.workspace.source_path),
+                # Prefer structured history. Keep the plain text for backwards compatibility.
+                "history": entries,
+                "history_text": history_text,
+                "agent": agent_state,
+                "tokens": agent_state.get("tokens", {}),
+            }
+            self._temp_session_path.write_text(json.dumps(state, indent=2, ensure_ascii=False), encoding="utf-8")
+        except Exception:
+            pass
 
     class ChatInput(TextArea):
         ALLOW_SELECT = True
@@ -393,26 +471,42 @@ class ChatApp(App[None]):
         inputbar.styles.max_height = outer_h
 
     def _append_raw(self, text: str) -> None:
-        self._history.append(text)
+        self._history_full.append(text)
+        self._history_display.append(text)
         self._render_transcript_chunk(text)
+        self._write_temp_session()
 
     def _append_system(self, text: str) -> None:
-        self._append_raw(f"[SYSTEM] {text}\n\n")
+        self._append_entry(tag="SYSTEM", content=text, block=False)
 
     def _append_user(self, text: str) -> None:
-        self._append_raw(f"[YOU] {text}\n\n")
+        self._append_entry(tag="YOU", content=text, block=False)
 
     def _append_agent(self, text: str) -> None:
-        self._append_raw(f"[AGENT] {text}\n\n")
+        self._append_entry(tag="AGENT", content=text, block=False)
 
     def _append_block(self, title: str, content: str) -> None:
-        self._append_raw(f"[{title.upper()}]\n{content}\n\n")
+        self._append_entry(tag=title.upper(), content=content, block=True)
 
     def _append_error(self, text: str) -> None:
-        self._append_raw(f"[ERROR] {text}\n\n")
+        self._append_entry(tag="ERROR", content=text, block=False)
 
     def _get_transcript_plain_text(self) -> str:
-        return "".join(self._history)
+        return "".join(self._history_display)
+
+    def _serialize_entries(self, entries: list[TranscriptEntry]) -> str:
+        chunks: list[str] = []
+        for e in entries:
+            tag = e.tag.strip()
+            content = e.content or ""
+            if tag == "TEXT":
+                chunks.append(content + "\n")
+                continue
+            if tag.upper() in {"YOU", "AGENT", "SYSTEM", "ERROR"}:
+                chunks.append(f"[{tag.upper()}] {content}\n\n")
+            else:
+                chunks.append(f"[{tag.upper()}]\n{content}\n\n")
+        return "".join(chunks)
 
     def _render_transcript_chunk(self, chunk: str) -> None:
         transcript = self._transcript()
@@ -434,29 +528,105 @@ class ChatApp(App[None]):
         if last_response_idx < 0:
             return entries
 
+        def parse_mapping(content: str) -> Optional[dict[str, Any]]:
+            raw = (content or "").strip()
+            if not raw:
+                return None
+            try:
+                obj = json.loads(raw)
+                return obj if isinstance(obj, dict) else None
+            except Exception:
+                pass
+            try:
+                obj = ast.literal_eval(raw)
+                return obj if isinstance(obj, dict) else None
+            except Exception:
+                return None
+
         def extract_tool_from_tool_call(content: str) -> Optional[str]:
             for line in (content or "").splitlines():
                 m = re.match(r"\\s*tool\\s*:\\s*(.+?)\\s*$", line, flags=re.IGNORECASE)
                 if m:
                     return m.group(1).strip() or None
-            try:
-                obj = json.loads(content)
-            except Exception:
-                return None
+
+            obj = parse_mapping(content)
             if isinstance(obj, dict):
-                for k in ("tool", "name", "skill", "action"):
+                v = obj.get("tool", None)
+                if isinstance(v, str) and v.strip():
+                    return v.strip()
+                v = obj.get("name", None)
+                if isinstance(v, str) and v.strip():
+                    return v.strip()
+                fn = obj.get("function", None)
+                if isinstance(fn, dict):
+                    v = fn.get("name", None)
+                    if isinstance(v, str) and v.strip():
+                        return v.strip()
+                for k in ("skill", "action"):
                     v = obj.get(k)
                     if isinstance(v, str) and v.strip():
                         return v.strip()
+
+            # Last-resort: try to extract `"tool": "..."` / `"name": "..."` patterns.
+            m = re.search(r"\"(?:tool|name)\"\\s*:\\s*\"([^\"]+)\"", content or "")
+            if m:
+                return m.group(1).strip() or None
             return None
 
-        def extract_tool_or_skill_from_result(content: str) -> Optional[tuple[str, str]]:
-            try:
-                obj = json.loads(content)
-            except Exception:
+        def extract_args_from_tool_call(content: str) -> Optional[dict[str, Any]]:
+            if not (content or "").strip():
                 return None
+            # Preferred format: `tool: ...\nargs:\n{...}`.
+            lines = (content or "").splitlines()
+            for i, line in enumerate(lines):
+                # Single-line format: `args: {...}`
+                m_inline = re.match(r"\\s*args\\s*:\\s*(\\{.*\\})\\s*$", line, flags=re.IGNORECASE)
+                if m_inline:
+                    obj = parse_mapping(m_inline.group(1))
+                    return obj if isinstance(obj, dict) else None
+
+                if re.match(r"\\s*args\\s*:\\s*$", line, flags=re.IGNORECASE):
+                    raw = "\n".join(lines[i + 1 :]).strip()
+                    obj = parse_mapping(raw)
+                    return obj if isinstance(obj, dict) else None
+
+            obj = parse_mapping(content)
             if not isinstance(obj, dict):
                 return None
+            # New format: { "tool": "...", "args": { ... } }
+            args = obj.get("args", None)
+            if isinstance(args, dict):
+                return args
+            # Alternate: { "name": "...", "arguments": {...} } or arguments as JSON string
+            args = obj.get("arguments", None)
+            if isinstance(args, dict):
+                return args
+            if isinstance(args, str) and args.strip():
+                parsed = parse_mapping(args)
+                if isinstance(parsed, dict):
+                    return parsed
+            fn = obj.get("function", None)
+            if isinstance(fn, dict):
+                args = fn.get("args", None)
+                if isinstance(args, dict):
+                    return args
+                args = fn.get("arguments", None)
+                if isinstance(args, dict):
+                    return args
+                if isinstance(args, str) and args.strip():
+                    parsed = parse_mapping(args)
+                    if isinstance(parsed, dict):
+                        return parsed
+            # Legacy fallback: the object itself is args
+            return obj
+
+        def extract_tool_or_skill_from_result(content: str) -> Optional[tuple[str, str]]:
+            obj = parse_mapping(content)
+            if not isinstance(obj, dict):
+                return None
+            v = obj.get("tool", None)
+            if isinstance(v, str) and v.strip():
+                return ("tool", v.strip())
             for k in ("skill", "tool", "name", "action"):
                 v = obj.get(k)
                 if isinstance(v, str) and v.strip():
@@ -478,22 +648,75 @@ class ChatApp(App[None]):
                 return extract_tool_from_tool_call(entries[j].content or "")
             return None
 
+        def reason_for_result(content: str) -> str:
+            obj = parse_mapping(content)
+            if not isinstance(obj, dict):
+                return ""
+            # New format: { "tool": "...", "result": { ... } }
+            inner = obj.get("result", None)
+            if isinstance(inner, dict):
+                for k in ("reason", "llm_reason", "llm_error", "error"):
+                    v = inner.get(k, None)
+                    if isinstance(v, str) and v.strip():
+                        return v.strip()
+            for k in ("reason", "llm_reason", "llm_error", "error"):
+                v = obj.get(k, None)
+                if isinstance(v, str) and v.strip():
+                    return v.strip()
+            return ""
+
+        def nearest_tool_call_payload(index: int) -> tuple[Optional[str], Optional[dict[str, Any]]]:
+            for j in range(index - 1, -1, -1):
+                if entries[j].tag.strip().upper() != "TOOL CALL":
+                    continue
+                return (extract_tool_from_tool_call(entries[j].content or ""), extract_args_from_tool_call(entries[j].content or ""))
+            return (None, None)
+
         out: list[TranscriptEntry] = []
         for idx, entry in enumerate(entries):
             tag = entry.tag.strip().upper()
             if idx < last_response_idx and tag in {"TOOL CALL", "TOOL RESULT"}:
                 if tag == "TOOL CALL":
                     tool = extract_tool_from_tool_call(entry.content or "")
-                    collapsed = f"tool: {tool}" if tool else "tool: (truncated)"
+                    parsed_args = extract_args_from_tool_call(entry.content or "")
+                    args = parsed_args if isinstance(parsed_args, dict) else {}
+                    reason = ""
+                    if isinstance(args, dict):
+                        v = args.get("reason", None)
+                        if isinstance(v, str) and v.strip():
+                            reason = v.strip()
+                    try:
+                        args_json = json.dumps(args, ensure_ascii=False)
+                    except Exception:
+                        args_json = "{}"
+                    if not tool:
+                        fallback = (entry.content or "").strip().splitlines()[0:1]
+                        tool = (fallback[0][:60] + "…") if fallback and len(fallback[0]) > 60 else (fallback[0] if fallback else "(unknown)")
+                    collapsed_lines = [f"tool: {tool}"]
+                    if reason:
+                        collapsed_lines.append(f"reason: {reason}")
+                    collapsed_lines.append(f"args: {args_json if parsed_args is not None else '(unparsed)'}")
+                    collapsed = "\n".join(collapsed_lines)
                     out.append(TranscriptEntry(tag=entry.tag, content=collapsed))
                 else:
                     payload = extract_tool_or_skill_from_result(entry.content or "")
-                    if payload is not None:
-                        label, name = payload
-                        collapsed = f"{label}: {name}"
+                    tool = payload[1] if payload is not None else None
+                    if tool is None:
+                        tool, args = nearest_tool_call_payload(idx)
                     else:
-                        tool = tool_name_for_result_at(idx)
-                        collapsed = f"tool: {tool}" if tool else "tool: (truncated)"
+                        _, args = nearest_tool_call_payload(idx)
+                    reason = reason_for_result(entry.content or "")
+                    try:
+                        args_json = json.dumps(args or {}, ensure_ascii=False)
+                    except Exception:
+                        args_json = "{}"
+                    if not tool:
+                        tool = "(unknown)"
+                    collapsed_lines = [f"tool: {tool}"]
+                    if reason:
+                        collapsed_lines.append(f"reason: {reason}")
+                    collapsed_lines.append(f"args: {args_json}")
+                    collapsed = "\n".join(collapsed_lines)
                     out.append(TranscriptEntry(tag=entry.tag, content=collapsed))
                 continue
             out.append(entry)
@@ -579,7 +802,9 @@ class ChatApp(App[None]):
         return Text(content, style=t.fg)
 
     def _rerender_transcript_from_history(self) -> None:
-        self._render_transcript_full("".join(self._history))
+        # Render the full transcript in the UI (no truncation/collapse).
+        self._history_display = list(self._history_full)
+        self._render_transcript_full("".join(self._history_display))
 
     def action_focus_transcript(self) -> None:
         self._transcript().focus()
@@ -751,11 +976,14 @@ class ChatApp(App[None]):
                 return True
             if sub == "save":
                 name = rest[0] if rest else datetime.now().strftime("session_%Y%m%d_%H%M%S")
+                history_text = "".join(self._history_full)
                 agent_state = self._agent.export_session()
+                entries = list(self._history_entries)
                 state = {
                     "name": name,
                     "workspace": str(self._agent.workspace.source_path),
-                    "history": "".join(self._history),
+                    "history": entries,
+                    "history_text": history_text,
                     "agent": agent_state,
                     "tokens": agent_state.get("tokens", {}),
                 }
@@ -777,8 +1005,20 @@ class ChatApp(App[None]):
                         self._agent.set_workspace(st_ws)
                     except Exception as e:
                         self._append_error(f"Failed to load workspace from session: {e}")
-                self._history = [str(state.get("history", ""))]
-                self._render_transcript_full("".join(self._history))
+                hist_val = state.get("history", "")
+                history_text = ""
+                if isinstance(hist_val, str):
+                    history_text = hist_val
+                elif isinstance(hist_val, list):
+                    items: list[dict[str, Any]] = [it for it in hist_val if isinstance(it, dict)]
+                    history_text = self._serialize_history_items(items)
+                    self._history_entries = items
+                else:
+                    history_text = str(state.get("history_text", ""))
+
+                self._history_full = [history_text]
+                self._history_display = [history_text]
+                self._rerender_transcript_from_history()
                 agent_state = state.get("agent", {})
                 if isinstance(agent_state, dict):
                     self._agent.import_session(agent_state)
@@ -818,8 +1058,11 @@ class ChatApp(App[None]):
             if text == "2":
                 self._confirm_mode = None
                 # Clear transcript + reset agent memory, without saving.
-                self._history = []
+                self._history_display = []
+                self._history_full = []
+                self._history_entries = []
                 self._transcript().clear()
+                self._clear_temp_session()
                 try:
                     self._agent.import_session(
                         {
@@ -907,17 +1150,17 @@ class ChatApp(App[None]):
             action = str(ev.get("action", ""))
             action_input = ev.get("action_input", {})
             try:
-                ai = json.dumps(action_input, indent=2)
+                ai = json.dumps({"tool": action, "args": action_input}, indent=2, ensure_ascii=False)
             except Exception:
-                ai = str(action_input)
-            self._append_block("Tool Call", f"tool: {action}\nargs:\n{ai}")
+                ai = str({"tool": action, "args": action_input})
+            self._append_block("Tool Call", ai)
             return
         if t == "result":
             result = ev.get("result", {})
             try:
-                rtxt = json.dumps(result, indent=2)
+                rtxt = json.dumps({"tool": str(ev.get("action", "")), "result": result}, indent=2, ensure_ascii=False)
             except Exception:
-                rtxt = str(result)
+                rtxt = str({"tool": str(ev.get("action", "")), "result": result})
             self._append_block("Tool Result", rtxt)
             return
         if t == "finish":

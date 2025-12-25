@@ -35,6 +35,9 @@ def list_sessions() -> list[str]:
         return []
     out: list[str] = []
     for p in sorted(SESSIONS_DIR.glob("*.json")):
-        out.append(p.stem)
+        stem = p.stem
+        # Hide temporary / internal sessions from the UI.
+        if stem.startswith(".") or stem.startswith("__temp"):
+            continue
+        out.append(stem)
     return out
-

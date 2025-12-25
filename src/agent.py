@@ -311,25 +311,60 @@ class VisualAutomationAgent:
         openai_tools = self._openai_tools()
         known_tools = {t.get("name") for t in openai_tools}
 
+        def tool_schemas_text() -> str:
+            parts: list[str] = []
+            for t in openai_tools:
+                name = str(t.get("name", "")).strip()
+                desc = str(t.get("description", "")).strip()
+                params = t.get("parameters", {})
+                try:
+                    import json as _json
+
+                    schema = _json.dumps(params, ensure_ascii=False)
+                except Exception:
+                    schema = "{}"
+                if not name:
+                    continue
+                line = f"- {name}: {desc}\n  inputSchema: {schema}"
+                parts.append(line)
+            return "\n".join(parts) if parts else "(none)"
+
         plan: list[str] = []
+        planned_steps: list[dict[str, Any]] = []
         try:
             plan_out = self.llm.plan_step(
                 system_prompt=SYSTEM_PROMPT,
                 user_prompt=user_command,
                 memory_text=self._memory_text(),
                 workspace_text=self._workspace_text(),
+                tools_text=tool_schemas_text(),
             )
             self._accumulate_last_usage()
             raw_plan = plan_out.get("plan", None)
             if isinstance(raw_plan, list) and all(isinstance(x, str) for x in raw_plan):
                 plan = [x.strip() for x in raw_plan if x.strip()]
+
+            raw_steps = plan_out.get("steps", None)
+            if isinstance(raw_steps, list):
+                for step in raw_steps:
+                    if not isinstance(step, dict):
+                        continue
+                    tool = step.get("tool", None)
+                    args = step.get("args", None)
+                    if not isinstance(tool, str) or not tool.strip():
+                        continue
+                    if not isinstance(args, dict):
+                        continue
+                    planned_steps.append({"tool": tool.strip(), "args": dict(args), "purpose": str(step.get("purpose", "")).strip()})
         except Exception:
             plan = []
+            planned_steps = []
 
         if plan:
             self._remember("Plan:\n" + "\n".join(f"- {x}" for x in plan))
             self._emit("plan", plan=plan)
         try:
+            step_ptr = 0
             for i in range(1, self.config.max_steps + 1):
                 obs_text, obs_images = self._default_observation()
                 self._emit(
@@ -339,27 +374,33 @@ class VisualAutomationAgent:
                     rois=[{"name": n, "description": d} for (n, d, _img) in obs_images],
                 )
 
-                model_out = self.llm.react_step(
-                    system_prompt=SYSTEM_PROMPT,
-                    user_prompt=f"USER COMMAND: {user_command}",
-                    memory_text=self._memory_text(),
-                    plan_text="\n".join(f"- {x}" for x in plan) if plan else "(none)",
-                    observation_text=obs_text,
-                    observation_images=obs_images,
-                    tools=openai_tools,
-                )
-                self._accumulate_last_usage()
+                if planned_steps:
+                    if step_ptr >= len(planned_steps):
+                        action = "finish"
+                        action_input: dict[str, Any] = {}
+                    else:
+                        cur = planned_steps[step_ptr]
+                        action = str(cur.get("tool", "")).strip()
+                        action_input = dict(cur.get("args", {}) if isinstance(cur.get("args", {}), dict) else {})
+                else:
+                    model_out = self.llm.react_step(
+                        system_prompt=SYSTEM_PROMPT,
+                        user_prompt=f"USER COMMAND: {user_command}",
+                        memory_text=self._memory_text(),
+                        plan_text="\n".join(f"- {x}" for x in plan) if plan else "(none)",
+                        observation_text=obs_text,
+                        observation_images=obs_images,
+                        tools=openai_tools,
+                    )
+                    self._accumulate_last_usage()
 
-                say = str(model_out.get("text", "")).strip()
-                tool_calls = model_out.get("tool_calls", [])
-                if not isinstance(tool_calls, list) or not tool_calls:
-                    tool_calls = [{"name": "finish", "arguments": {}}]
-                tool_call = tool_calls[0] if isinstance(tool_calls[0], dict) else {"name": "finish", "arguments": {}}
+                    tool_calls = model_out.get("tool_calls", [])
+                    if not isinstance(tool_calls, list) or not tool_calls:
+                        tool_calls = [{"name": "finish", "arguments": {}}]
+                    tool_call = tool_calls[0] if isinstance(tool_calls[0], dict) else {"name": "finish", "arguments": {}}
 
-                action = str(tool_call.get("name", "")).strip()
-                action_input = tool_call.get("arguments", {}) if isinstance(tool_call.get("arguments", {}), dict) else {}
-                if not say:
-                    say = action or "(tool)"
+                    action = str(tool_call.get("name", "")).strip()
+                    action_input = tool_call.get("arguments", {}) if isinstance(tool_call.get("arguments", {}), dict) else {}
 
                 if action not in known_tools:
                     raise ValueError(f"Unknown tool requested by model: {action!r}")
@@ -372,7 +413,7 @@ class VisualAutomationAgent:
                     except Exception:
                         signature = f"{action}:?"
 
-                if signature is not None and signature == self._last_action_signature:
+                if not planned_steps and signature is not None and signature == self._last_action_signature:
                     # Force an observation instead of blindly repeating the exact same action.
                     if self._observed_since_last_action:
                         action = "finish"
@@ -383,6 +424,31 @@ class VisualAutomationAgent:
                         action_input = {"rois": [r.name for r in self.workspace.rois]}
                         say = "Re-checking ROIs after the last action to confirm the current state."
 
+                narration: Mapping[str, Any] = {}
+                say = ""
+                plan_block = None
+                observation_summary = ""
+                rationale = ""
+                try:
+                    narration = self.llm.narrate_tool_call(
+                        system_prompt=SYSTEM_PROMPT,
+                        user_command=user_command,
+                        plan_text="\n".join(f"- {x}" for x in plan) if plan else "(none)",
+                        memory_text=self._memory_text(),
+                        observation_text=obs_text,
+                        tool_name=action,
+                        tool_args=action_input,
+                    )
+                    self._accumulate_last_usage()
+                except Exception:
+                    narration = {}
+
+                say = str(narration.get("say", "")).strip() or action
+                if isinstance(narration.get("plan", None), list) and all(isinstance(x, str) for x in narration["plan"]):
+                    plan_block = [x.strip() for x in narration["plan"] if isinstance(x, str) and x.strip()]
+                observation_summary = str(narration.get("observation", "")).strip()
+                rationale = str(narration.get("rationale", "")).strip()
+
                 self.logger.narrate(f"[Agent] Step {i}/{self.config.max_steps}: {say}")
                 self._remember(f"Agent: {say}")
                 self._emit(
@@ -391,9 +457,9 @@ class VisualAutomationAgent:
                     say=say,
                     action=action,
                     action_input=action_input,
-                    plan=None,
-                    observation="",
-                    rationale="",
+                    plan=plan_block,
+                    observation=observation_summary,
+                    rationale=rationale,
                 )
 
                 flow = self._call_mcp_tool(
@@ -404,6 +470,9 @@ class VisualAutomationAgent:
                     signature=signature,
                     results=results,
                 )
+                self._remember(f"Tool: {action} args={action_input}")
+                if planned_steps:
+                    step_ptr += 1
                 if flow == "break":
                     break
         finally:

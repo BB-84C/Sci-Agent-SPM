@@ -140,6 +140,52 @@ class OpenAiMultimodalClient:
 
         return {"text": out_text, "tool_calls": tool_calls}
 
+    def narrate_tool_call(
+        self,
+        *,
+        system_prompt: str,
+        user_command: str,
+        plan_text: str,
+        memory_text: str,
+        observation_text: str,
+        tool_name: str,
+        tool_args: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        narrator_system = (
+            f"{system_prompt}\n\n"
+            "NARRATION MODE:\n"
+            "- Do not call any tools.\n"
+            "- Return ONLY one JSON object.\n"
+            '- JSON keys: "say" (required), "plan" (optional list), "observation" (optional), "rationale" (optional).\n'
+            "- say: 1-2 short sentences describing what you will do now and what you will check next.\n"
+            "- rationale: 1 short sentence (no hidden chain-of-thought).\n"
+        )
+        try:
+            args_json = json.dumps(dict(tool_args), ensure_ascii=False)
+        except Exception:
+            args_json = "{}"
+        full_user = (
+            f"USER COMMAND: {user_command}\n\n"
+            f"SESSION MEMORY (recent):\n{memory_text}\n\n"
+            f"PLAN:\n{plan_text}\n\n"
+            f"CURRENT OBSERVATION:\n{observation_text}\n\n"
+            f"NEXT TOOL CALL:\nname: {tool_name}\narguments: {args_json}\n\n"
+            "Return ONLY valid JSON."
+        )
+        resp = self._client.responses.create(
+            model=self._config.model,
+            input=[
+                {"role": "system", "content": narrator_system},
+                {"role": "user", "content": [{"type": "input_text", "text": full_user}]},
+            ],
+            tool_choice="none",
+            max_output_tokens=250,
+            timeout=self._config.timeout_s,
+        )
+        self._set_last_usage(resp)
+        text = getattr(resp, "output_text", None) or ""
+        return _extract_json_object(text)
+
     def plan_step(
         self,
         *,
@@ -147,17 +193,23 @@ class OpenAiMultimodalClient:
         user_prompt: str,
         memory_text: str,
         workspace_text: str,
+        tools_text: str,
     ) -> Mapping[str, Any]:
         planner_system = (
             f"{system_prompt}\n\n"
             "PLANNING MODE:\n"
             "- Do not call any tools.\n"
             "- Return ONLY one JSON object.\n"
-            "- JSON keys: plan (list of short steps), success_criteria (list), risks (list).\n"
+            "- JSON keys: plan (list of short steps), steps (list), success_criteria (list), risks (list).\n"
+            "- steps: ordered list of tool calls to execute, each item is:\n"
+            '  { "tool": "<tool_name>", "args": { ... }, "purpose": "<short>" }\n'
+            "- Use only anchors/ROIs that exist in WORKSPACE.\n"
+            "- Prefer explicit values/units (e.g., 200mV, 50pA).\n"
         )
         full_user = (
             f"USER COMMAND: {user_prompt}\n\n"
             f"SESSION MEMORY (recent):\n{memory_text}\n\n"
+            f"TOOLS (schemas):\n{tools_text}\n\n"
             f"WORKSPACE:\n{workspace_text}\n\n"
             "Return ONLY valid JSON."
         )
