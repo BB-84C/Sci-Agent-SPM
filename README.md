@@ -47,6 +47,20 @@ Tip: Use a screen ruler tool or a quick one-off script to print mouse coordinate
 .\.venv\Scripts\python -m src.main --agent
 ```
 
+### One-command bootstrap + run
+
+From the repo root, this script will create a venv (if needed), install deps, ensure `workspace.json`, prompt for your OpenAI key (if missing), and start the TUI:
+
+```powershell
+.\Sci-Agent-STM.ps1
+```
+
+Optional: install a user-level `Sci-Agent-STM` command (adds `~\.local\bin` to your user `PATH` if needed):
+
+```powershell
+.\tools\install_sci_agent_stm.ps1
+```
+
 ### Agent mode (LLM, multimodal)
 
 Set your OpenAI key in `OPENAI_API` (or `OPENAI_API_KEY`):
