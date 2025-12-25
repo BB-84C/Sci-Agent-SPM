@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from typing import Any, Iterable, Mapping, Optional
 
 from PIL import Image
+from openai.types.responses.response_function_tool_call import ResponseFunctionToolCall
 
 
 def _img_to_data_url(img: Image.Image) -> str:
@@ -93,9 +94,10 @@ class OpenAiMultimodalClient:
         system_prompt: str,
         user_prompt: str,
         memory_text: str,
+        plan_text: str,
         observation_text: str,
         observation_images: Iterable[tuple[str, str, Image.Image]],
-        tool_names: Iterable[str],
+        tools: Iterable[Mapping[str, Any]],
     ) -> Mapping[str, Any]:
         images_payload: list[dict[str, Any]] = []
         for name, description, img in observation_images:
@@ -104,13 +106,12 @@ class OpenAiMultimodalClient:
             images_payload.append({"type": "input_text", "text": label})
             images_payload.append({"type": "input_image", "image_url": _img_to_data_url(img)})
 
-        tool_list = ", ".join(tool_names)
         full_user = (
             f"{user_prompt}\n\n"
             f"SESSION MEMORY (recent):\n{memory_text}\n\n"
-            f"TOOLS AVAILABLE: {tool_list}\n\n"
+            f"PLAN:\n{plan_text}\n\n"
             f"OBSERVATION (text):\n{observation_text}\n\n"
-            f"Return ONLY valid JSON."
+            "Call exactly one tool. Keep any narration short and demo-friendly."
         )
 
         resp = self._client.responses.create(
@@ -119,6 +120,54 @@ class OpenAiMultimodalClient:
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": [{"type": "input_text", "text": full_user}, *images_payload]},
             ],
+            tools=list(tools),
+            tool_choice="required",
+            parallel_tool_calls=False,
+            timeout=self._config.timeout_s,
+        )
+        self._set_last_usage(resp)
+        out_text = getattr(resp, "output_text", None) or ""
+
+        tool_calls: list[dict[str, Any]] = []
+        for item in getattr(resp, "output", None) or []:
+            if isinstance(item, ResponseFunctionToolCall) and item.name:
+                args_raw = item.arguments or "{}"
+                try:
+                    args = json.loads(args_raw) if isinstance(args_raw, str) else {}
+                except Exception:
+                    args = {}
+                tool_calls.append({"name": item.name, "arguments": args, "call_id": item.call_id})
+
+        return {"text": out_text, "tool_calls": tool_calls}
+
+    def plan_step(
+        self,
+        *,
+        system_prompt: str,
+        user_prompt: str,
+        memory_text: str,
+        workspace_text: str,
+    ) -> Mapping[str, Any]:
+        planner_system = (
+            f"{system_prompt}\n\n"
+            "PLANNING MODE:\n"
+            "- Do not call any tools.\n"
+            "- Return ONLY one JSON object.\n"
+            "- JSON keys: plan (list of short steps), success_criteria (list), risks (list).\n"
+        )
+        full_user = (
+            f"USER COMMAND: {user_prompt}\n\n"
+            f"SESSION MEMORY (recent):\n{memory_text}\n\n"
+            f"WORKSPACE:\n{workspace_text}\n\n"
+            "Return ONLY valid JSON."
+        )
+        resp = self._client.responses.create(
+            model=self._config.model,
+            input=[
+                {"role": "system", "content": planner_system},
+                {"role": "user", "content": [{"type": "input_text", "text": full_user}]},
+            ],
+            tool_choice="none",
             timeout=self._config.timeout_s,
         )
         self._set_last_usage(resp)

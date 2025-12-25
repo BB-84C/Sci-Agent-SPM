@@ -885,6 +885,11 @@ class ChatApp(App[None]):
             self.busy = False
             self._set_status("Ready")
             return
+        if t == "plan":
+            plan = ev.get("plan", None)
+            if isinstance(plan, list) and plan:
+                self._append_block("Plan", "\n".join(f"- {x}" for x in plan))
+            return
         if t == "decision":
             say = str(ev.get("say", "")).strip()
             if say:

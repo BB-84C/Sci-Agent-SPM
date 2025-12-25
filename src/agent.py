@@ -2,55 +2,39 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, replace
-from typing import Any, Callable, Iterable, Mapping, Optional
+from typing import Any, Callable, Iterable, Literal, Mapping, Optional
+
+import anyio
+from mcp.shared.memory import create_connected_server_and_client_session
 
 from .actions import ActionConfig, Actor
 from .abort import start_abort_hotkey
 from .capture import ScreenCapturer
 from .llm_client import LlmConfig, OpenAiMultimodalClient
 from .logger import RunLogger
-from .tools import BASE_TOOL_NAMES
-from .tools.click_anchor import handle as tool_click_anchor
-from .tools.fail import handle as tool_fail
-from .tools.finish import handle as tool_finish
-from .tools.launch_calibrator import handle as tool_launch_calibrator
-from .tools.observe import handle as tool_observe
-from .tools.wait_until import handle as tool_wait_until
-from .tools.set_field import handle as tool_set_field
+from .mcp_server import McpToolContext, create_mcp_server
 from .workspace import Workspace, load_workspace
 
 
-SYSTEM_PROMPT = """You are an automation agent controlling a Windows desktop app via fixed click anchors and ROI screenshots.
+SYSTEM_PROMPT = """You are an automation agent controlling a Windows desktop app via ROI screenshots and fixed click anchors.
 You MUST NOT claim to click UI elements by name; you can only use provided anchors and ROIs.
 
 You operate in ReAct style:
 - You see OBSERVATION text + ROI screenshots.
-- You choose ONE tool action at a time.
-- After each action, you will get a new observation.
+- You call exactly ONE available tool per step.
+- After each tool call, you will receive a new observation.
 
-Return ONLY JSON with keys:
-  - "action": one of ["observe","wait_until","click_anchor","set_field","launch_calibrator","finish","fail"]
-  - "action_input": object with parameters for the action
-  - "say": short, demo-friendly narration (1-2 sentences, no internal reasoning)
-Optional keys (keep short):
-  - "plan": list of 1-line steps
-  - "observation": short summary of what you see
-  - "rationale": short reason for the chosen action (1 sentence)
+Keep any narration short (1–2 sentences). Do not reveal internal reasoning.
 
 Guidelines:
-- If the user asks to recalibrate ROIs/anchors, choose launch_calibrator.
-- If units differ (V vs mV), decide an appropriate numeric entry so the resulting value equals the user's target.
+- If the user asks to recalibrate ROIs/anchors, call the calibrator tool.
 - Prefer observing relevant ROIs after taking actions.
-- Avoid repeating actions without checking results. If the ROI looks correct, choose finish.
+- Avoid repeating actions without checking results. If the UI looks correct, finish.
 
 IMPORTANT:
-- Do not rely on OCR. Use the ROI images directly to judge whether values changed as intended.
-- For set_field (generic), provide:
-  - {"anchor": "<anchor_name>", "typed_text": "<text>", "submit": "enter"|"tab"|null, "rois": ["roi1","roi2"] }
-  - You should choose anchor/roi names from the workspace lists in OBSERVATION.
-- If a requested action requires an anchor that does not exist, choose launch_calibrator (not fail).
- - For wait_until, provide:
-  - {"roi": "<roi_name>", "seconds": <int>, "max_rounds": <int optional>, "max_total_seconds": <int optional>, "reason": "<string optional>"}
+- Use the ROI images directly to judge whether values changed as intended.
+- Choose anchor/ROI names from the workspace lists in OBSERVATION.
+- If a requested action requires an anchor or ROI that does not exist, call the calibrator tool (do not fail).
 """
 
 
@@ -98,6 +82,10 @@ class VisualAutomationAgent:
         self._tokens_in: int = 0
         self._tokens_out: int = 0
         self._tokens_total: int = 0
+
+        self._mcp = create_mcp_server(agent=self)
+        self._openai_tools_cache: Optional[list[dict[str, Any]]] = None
+        self._mcp_tool_ctx: Optional[McpToolContext] = None
 
     def _emit(self, event_type: str, **payload: Any) -> None:
         if self._event_sink is None:
@@ -209,8 +197,55 @@ class VisualAutomationAgent:
             total_tokens=self._tokens_total,
         )
 
-    def _tool_names(self) -> list[str]:
-        return list(BASE_TOOL_NAMES)
+    def _openai_tools(self) -> list[dict[str, Any]]:
+        if self._openai_tools_cache is not None:
+            return list(self._openai_tools_cache)
+
+        async def _list() -> list[dict[str, Any]]:
+            async with create_connected_server_and_client_session(self._mcp) as mcp_session:
+                mcp_tools = await mcp_session.list_tools()
+            openai_tools: list[dict[str, Any]] = []
+            for t in mcp_tools.tools:
+                openai_tools.append(
+                    {
+                        "type": "function",
+                        "name": t.name,
+                        "description": t.description or "",
+                        "parameters": t.inputSchema,
+                        "strict": False,
+                    }
+                )
+            return openai_tools
+
+        self._openai_tools_cache = anyio.run(_list)
+        return list(self._openai_tools_cache)
+
+    def _call_mcp_tool(
+        self,
+        *,
+        tool_name: str,
+        tool_args: Mapping[str, Any],
+        step_index: int,
+        say: str,
+        signature: Optional[str],
+        results: list[dict[str, Any]],
+    ) -> Literal["continue", "break"]:
+        self._mcp_tool_ctx = McpToolContext(step_index=step_index, say=say, signature=signature, results=results)
+
+        async def _call() -> str:
+            async with create_connected_server_and_client_session(self._mcp) as mcp_session:
+                res = await mcp_session.call_tool(tool_name, dict(tool_args))
+            for item in res.content:
+                if getattr(item, "type", None) == "text":
+                    return str(getattr(item, "text", "")).strip()
+            return "continue"
+
+        try:
+            flow = anyio.run(_call).strip().lower()
+        finally:
+            self._mcp_tool_ctx = None
+
+        return "break" if flow == "break" else "continue"
 
     def _workspace_text(self) -> str:
         rois = "\n".join(f"- {r.name}: {r.description}" for r in self.workspace.rois) or "(none)"
@@ -272,7 +307,28 @@ class VisualAutomationAgent:
         if self.config.abort_hotkey:
             self.logger.narrate("Abort hotkey: ESC")
 
-        results: list[Mapping[str, Any]] = []
+        results: list[dict[str, Any]] = []
+        openai_tools = self._openai_tools()
+        known_tools = {t.get("name") for t in openai_tools}
+
+        plan: list[str] = []
+        try:
+            plan_out = self.llm.plan_step(
+                system_prompt=SYSTEM_PROMPT,
+                user_prompt=user_command,
+                memory_text=self._memory_text(),
+                workspace_text=self._workspace_text(),
+            )
+            self._accumulate_last_usage()
+            raw_plan = plan_out.get("plan", None)
+            if isinstance(raw_plan, list) and all(isinstance(x, str) for x in raw_plan):
+                plan = [x.strip() for x in raw_plan if x.strip()]
+        except Exception:
+            plan = []
+
+        if plan:
+            self._remember("Plan:\n" + "\n".join(f"- {x}" for x in plan))
+            self._emit("plan", plan=plan)
         try:
             for i in range(1, self.config.max_steps + 1):
                 obs_text, obs_images = self._default_observation()
@@ -287,18 +343,26 @@ class VisualAutomationAgent:
                     system_prompt=SYSTEM_PROMPT,
                     user_prompt=f"USER COMMAND: {user_command}",
                     memory_text=self._memory_text(),
+                    plan_text="\n".join(f"- {x}" for x in plan) if plan else "(none)",
                     observation_text=obs_text,
                     observation_images=obs_images,
-                    tool_names=self._tool_names(),
+                    tools=openai_tools,
                 )
                 self._accumulate_last_usage()
 
-                action = str(model_out.get("action", "")).strip()
-                action_input = model_out.get("action_input", {}) if isinstance(model_out.get("action_input", {}), dict) else {}
-                say = str(model_out.get("say", "")).strip() or action
-                plan = model_out.get("plan", None)
-                observation_summary = str(model_out.get("observation", "")).strip() if "observation" in model_out else ""
-                rationale = str(model_out.get("rationale", "")).strip() if "rationale" in model_out else ""
+                say = str(model_out.get("text", "")).strip()
+                tool_calls = model_out.get("tool_calls", [])
+                if not isinstance(tool_calls, list) or not tool_calls:
+                    tool_calls = [{"name": "finish", "arguments": {}}]
+                tool_call = tool_calls[0] if isinstance(tool_calls[0], dict) else {"name": "finish", "arguments": {}}
+
+                action = str(tool_call.get("name", "")).strip()
+                action_input = tool_call.get("arguments", {}) if isinstance(tool_call.get("arguments", {}), dict) else {}
+                if not say:
+                    say = action or "(tool)"
+
+                if action not in known_tools:
+                    raise ValueError(f"Unknown tool requested by model: {action!r}")
 
                 signature = None
                 if action in {"wait_until", "click_anchor", "set_field", "launch_calibrator"}:
@@ -327,92 +391,21 @@ class VisualAutomationAgent:
                     say=say,
                     action=action,
                     action_input=action_input,
-                    plan=plan if isinstance(plan, list) else None,
-                    observation=observation_summary,
-                    rationale=rationale,
+                    plan=None,
+                    observation="",
+                    rationale="",
                 )
 
-                if action == "observe":
-                    flow = tool_observe(
-                        self,
-                        step_index=i,
-                        action_input=action_input,
-                        say=say,
-                        signature=signature,
-                        results=results,
-                    )
-                    if flow == "break":
-                        break
-                    continue
-
-                if action == "wait_until":
-                    tool_wait_until(
-                        self,
-                        step_index=i,
-                        action_input=action_input,
-                        say=say,
-                        signature=signature,
-                        results=results,
-                    )
-                    continue
-
-                if action == "click_anchor":
-                    tool_click_anchor(
-                        self,
-                        step_index=i,
-                        action_input=action_input,
-                        say=say,
-                        signature=signature,
-                        results=results,
-                    )
-                    continue
-
-                if action == "set_field":
-                    tool_set_field(
-                        self,
-                        step_index=i,
-                        action_input=action_input,
-                        say=say,
-                        signature=signature,
-                        results=results,
-                    )
-                    continue
-
-                if action == "launch_calibrator":
-                    tool_launch_calibrator(
-                        self,
-                        step_index=i,
-                        action_input=action_input,
-                        say=say,
-                        signature=signature,
-                        results=results,
-                    )
+                flow = self._call_mcp_tool(
+                    tool_name=action,
+                    tool_args=action_input,
+                    step_index=i,
+                    say=say,
+                    signature=signature,
+                    results=results,
+                )
+                if flow == "break":
                     break
-
-                if action == "finish":
-                    tool_finish(
-                        self,
-                        step_index=i,
-                        action_input=action_input,
-                        say=say,
-                        signature=signature,
-                        results=results,
-                    )
-                    break
-
-                if action == "fail":
-                    flow = tool_fail(
-                        self,
-                        step_index=i,
-                        action_input=action_input,
-                        say=say,
-                        signature=signature,
-                        results=results,
-                    )
-                    if flow == "break":
-                        break
-
-                raise ValueError(f"Invalid agent action: {action!r}")
         finally:
             if self._abort is not None:
                 self._abort.stop()
