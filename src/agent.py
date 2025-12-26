@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import time
 from dataclasses import dataclass, replace
 from typing import Any, Callable, Iterable, Literal, Mapping, Optional
@@ -27,14 +29,14 @@ You operate in ReAct style:
 Keep any narration short (1–2 sentences). Do not reveal internal reasoning.
 
 Guidelines:
-- If the user asks to recalibrate ROIs/anchors, call the calibrator tool.
+- If the user asks to recalibrate ROIs/anchors, call the calibration tool.
 - Prefer observing relevant ROIs after taking actions.
-- Avoid repeating actions without checking results. If the UI looks correct, finish.
+- Avoid repeating actions without checking results. If the UI looks correct, stop using a terminal tool.
 
 IMPORTANT:
 - Use the ROI images directly to judge whether values changed as intended.
 - Choose anchor/ROI names from the workspace lists in OBSERVATION.
-- If a requested action requires an anchor or ROI that does not exist, call the calibrator tool (do not fail).
+- If a requested action requires an anchor or ROI that does not exist, call the calibration tool (do not stop with an error).
 """
 
 
@@ -83,12 +85,14 @@ class VisualAutomationAgent:
         self._consecutive_observes: int = 0
         self._last_action_signature: Optional[str] = None
         self._observed_since_last_action: bool = True
+        self._last_observation_fingerprint: Optional[str] = None
         self._tokens_in: int = 0
         self._tokens_out: int = 0
         self._tokens_total: int = 0
 
         self._mcp = create_mcp_server(agent=self)
         self._openai_tools_cache: Optional[list[dict[str, Any]]] = None
+        self._tool_meta_by_name: dict[str, Mapping[str, Any]] = {}
         self._mcp_tool_ctx: Optional[McpToolContext] = None
 
     def _emit(self, event_type: str, **payload: Any) -> None:
@@ -219,6 +223,7 @@ class VisualAutomationAgent:
                 mcp_tools = await mcp_session.list_tools()
             openai_tools: list[dict[str, Any]] = []
             for t in mcp_tools.tools:
+                self._tool_meta_by_name[t.name] = dict(t.meta or {})
                 openai_tools.append(
                     {
                         "type": "function",
@@ -232,6 +237,52 @@ class VisualAutomationAgent:
 
         self._openai_tools_cache = anyio.run(_list)
         return list(self._openai_tools_cache)
+
+    def _pick_terminal_tool_name(self) -> str:
+        if self._openai_tools_cache is None:
+            self._openai_tools()
+        preferred: Optional[str] = None
+        for name, meta in self._tool_meta_by_name.items():
+            try:
+                md = dict(meta)
+                if not bool(md.get("terminal", False)):
+                    continue
+                if not bool(md.get("error", False)):
+                    return str(name)
+                if preferred is None:
+                    preferred = str(name)
+            except Exception:
+                continue
+        if preferred is not None:
+            return preferred
+        if self._tool_meta_by_name:
+            return next(iter(self._tool_meta_by_name.keys()))
+        raise RuntimeError("No tools available.")
+
+    def _call_signature(self, *, tool_name: str, tool_args: Mapping[str, Any]) -> str:
+        try:
+            normalized = json.dumps(tool_args, sort_keys=True, ensure_ascii=False, default=str)
+        except Exception:
+            try:
+                normalized = str(sorted((str(k), str(v)) for k, v in tool_args.items()))
+            except Exception:
+                normalized = "<?>"
+        return f"{tool_name}:{normalized}"
+
+    def _observation_fingerprint(self, images: Iterable[tuple[str, str, Any]]) -> str:
+        """
+        Fingerprint the current UI state using a downscaled byte signature of ROI images.
+        This avoids treating blank lines in observation text as state changes.
+        """
+        h = hashlib.sha1()
+        for name, _desc, img in images:
+            h.update(str(name).encode("utf-8", errors="ignore"))
+            try:
+                im = img.convert("RGB").resize((24, 24))
+                h.update(im.tobytes())
+            except Exception:
+                h.update(repr(img).encode("utf-8", errors="ignore"))
+        return h.hexdigest()
 
     def _call_mcp_tool(
         self,
@@ -325,6 +376,7 @@ class VisualAutomationAgent:
         results: list[dict[str, Any]] = []
         openai_tools = self._openai_tools()
         known_tools = {t.get("name") for t in openai_tools}
+        terminal_tool = self._pick_terminal_tool_name()
 
         def tool_schemas_text() -> str:
             parts: list[str] = []
@@ -382,6 +434,7 @@ class VisualAutomationAgent:
             step_ptr = 0
             for i in range(1, self.config.max_steps + 1):
                 obs_text, obs_images = self._default_observation()
+                obs_fp = self._observation_fingerprint(obs_images)
                 self._emit(
                     "observation",
                     step=i,
@@ -391,7 +444,7 @@ class VisualAutomationAgent:
 
                 if planned_steps:
                     if step_ptr >= len(planned_steps):
-                        action = "finish"
+                        action = terminal_tool
                         action_input: dict[str, Any] = {}
                     else:
                         cur = planned_steps[step_ptr]
@@ -411,8 +464,12 @@ class VisualAutomationAgent:
 
                     tool_calls = model_out.get("tool_calls", [])
                     if not isinstance(tool_calls, list) or not tool_calls:
-                        tool_calls = [{"name": "finish", "arguments": {}}]
-                    tool_call = tool_calls[0] if isinstance(tool_calls[0], dict) else {"name": "finish", "arguments": {}}
+                        tool_calls = [{"name": terminal_tool, "arguments": {}}]
+                    tool_call = (
+                        tool_calls[0]
+                        if isinstance(tool_calls[0], dict)
+                        else {"name": terminal_tool, "arguments": {}}
+                    )
 
                     action = str(tool_call.get("name", "")).strip()
                     action_input = tool_call.get("arguments", {}) if isinstance(tool_call.get("arguments", {}), dict) else {}
@@ -420,24 +477,59 @@ class VisualAutomationAgent:
                 if action not in known_tools:
                     raise ValueError(f"Unknown tool requested by model: {action!r}")
 
-                signature = None
-                if action in {"wait_until", "click_anchor", "set_field", "launch_calibrator"}:
-                    try:
-                        items = sorted((str(k), str(v)) for k, v in action_input.items())
-                        signature = f"{action}:{items}"
-                    except Exception:
-                        signature = f"{action}:?"
+                signature = self._call_signature(tool_name=action, tool_args=action_input)
 
-                if not planned_steps and signature is not None and signature == self._last_action_signature:
-                    # Force an observation instead of blindly repeating the exact same action.
-                    if self._observed_since_last_action:
-                        action = "finish"
-                        action_input = {}
-                        say = "UI appears stable after the last action; stopping to avoid repeating the same step."
+                # Generic loop-avoidance: if the model repeats the exact same tool call while the UI
+                # (as seen via ROIs) hasn't changed, re-ask once for a different call; otherwise stop.
+                if (
+                    self._last_action_signature is not None
+                    and self._last_observation_fingerprint is not None
+                    and signature == self._last_action_signature
+                    and obs_fp == self._last_observation_fingerprint
+                ):
+                    if planned_steps:
+                        say = "UI appears unchanged and the same action is repeating; stopping to avoid loops."
+                        results.append({"action": terminal_tool, "action_input": {}, "say": say})
+                        self._emit("finish", step=i, say=say)
+                        break
+
+                    retry_out = self.llm_tool.react_step(
+                        system_prompt=SYSTEM_PROMPT,
+                        user_prompt=(
+                            f"USER COMMAND: {user_command}\n\n"
+                            "Constraint: Do NOT repeat the immediately previous tool call (same tool and same arguments)."
+                        ),
+                        memory_text=self._memory_text(),
+                        plan_text="\n".join(f"- {x}" for x in plan) if plan else "(none)",
+                        observation_text=obs_text,
+                        observation_images=obs_images,
+                        tools=openai_tools,
+                    )
+                    self._accumulate_last_usage(self.llm_tool)
+                    retry_calls = retry_out.get("tool_calls", [])
+                    if isinstance(retry_calls, list) and retry_calls and isinstance(retry_calls[0], dict):
+                        retry_action = str(retry_calls[0].get("name", "")).strip()
+                        retry_args = retry_calls[0].get("arguments", {})
+                        if isinstance(retry_args, dict) and retry_action in known_tools:
+                            retry_sig = self._call_signature(tool_name=retry_action, tool_args=retry_args)
+                            if retry_sig != signature:
+                                action = retry_action
+                                action_input = dict(retry_args)
+                                signature = retry_sig
+                            else:
+                                say = "UI appears unchanged and the model is repeating the same action; stopping to avoid loops."
+                                results.append({"action": terminal_tool, "action_input": {}, "say": say})
+                                self._emit("finish", step=i, say=say)
+                                break
                     else:
-                        action = "observe"
-                        action_input = {"rois": [r.name for r in self.workspace.rois]}
-                        say = "Re-checking ROIs after the last action to confirm the current state."
+                        say = "UI appears unchanged and the model did not provide a different action; stopping to avoid loops."
+                        results.append({"action": terminal_tool, "action_input": {}, "say": say})
+                        self._emit("finish", step=i, say=say)
+                        break
+
+                # Record state for the next loop detection check.
+                self._last_action_signature = signature
+                self._last_observation_fingerprint = obs_fp
 
                 narration: Mapping[str, Any] = {}
                 say = ""

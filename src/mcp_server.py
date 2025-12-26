@@ -45,6 +45,7 @@ def create_mcp_server(*, agent: Any) -> FastMCP:
     @mcp_tool(
         name="observe",
         description="Capture and log ROI screenshots. Use to re-check the UI state.",
+        meta={"category": "observation"},
     )
     def observe(rois: Optional[list[str]] = None) -> Literal["continue", "break"]:
         ctx = _ctx()
@@ -63,6 +64,7 @@ def create_mcp_server(*, agent: Any) -> FastMCP:
     @mcp_tool(
         name="wait_until",
         description="Wait for a UI condition by repeatedly checking a ROI screenshot.",
+        meta={"category": "wait"},
     )
     def wait_until(
         roi: str,
@@ -92,6 +94,7 @@ def create_mcp_server(*, agent: Any) -> FastMCP:
     @mcp_tool(
         name="click_anchor",
         description="Click a fixed anchor point by name. Optionally capture ROIs after clicking.",
+        meta={"category": "action", "side_effects": True},
     )
     def click_anchor(anchor: str, rois: Optional[list[str]] = None) -> Literal["continue", "break"]:
         ctx = _ctx()
@@ -110,6 +113,7 @@ def create_mcp_server(*, agent: Any) -> FastMCP:
     @mcp_tool(
         name="set_field",
         description="Set a UI field by focusing an anchor and typing text, optionally submitting.",
+        meta={"category": "action", "side_effects": True},
     )
     def set_field(
         anchor: str,
@@ -133,6 +137,7 @@ def create_mcp_server(*, agent: Any) -> FastMCP:
     @mcp_tool(
         name="launch_calibrator",
         description="Launch the ROI/anchor calibrator GUI for the current workspace and stop.",
+        meta={"category": "calibration"},
     )
     def launch_calibrator() -> Literal["continue", "break"]:
         ctx = _ctx()
@@ -148,6 +153,7 @@ def create_mcp_server(*, agent: Any) -> FastMCP:
     @mcp_tool(
         name="finish",
         description="Stop the run successfully.",
+        meta={"category": "terminal", "terminal": True},
     )
     def finish() -> Literal["continue", "break"]:
         ctx = _ctx()
@@ -163,6 +169,7 @@ def create_mcp_server(*, agent: Any) -> FastMCP:
     @mcp_tool(
         name="fail",
         description="Stop the run with an error message (may launch the calibrator if appropriate).",
+        meta={"category": "terminal", "terminal": True, "error": True},
     )
     def fail(message: str = "Agent failed.") -> Literal["continue", "break"]:
         ctx = _ctx()
