@@ -224,6 +224,22 @@ class ChatApp(App[None]):
         except Exception:
             return ts_iso
 
+    def _normalize_for_transcript(self, text: str) -> str:
+        # The transcript parser treats *blank lines* as entry separators. If user/agent
+        # content contains `\n\n`, the extra blank line would prematurely end the entry,
+        # causing subsequent lines to lose the bubble/background styling.
+        #
+        # We keep the entry intact by replacing empty lines with a zero-width space
+        # (not considered whitespace by `str.strip()`), which renders invisibly but
+        # prevents the parser from terminating the block early.
+        s = (text or "").replace("\r\n", "\n").replace("\r", "\n")
+        parts = s.split("\n")
+        if len(parts) <= 1:
+            return s
+        zws = "\u200B"
+        parts = [p if p != "" else zws for p in parts]
+        return "\n".join(parts)
+
     def _serialize_history_items(self, items: list[dict[str, Any]]) -> str:
         chunks: list[str] = []
         for it in items:
@@ -236,16 +252,17 @@ class ChatApp(App[None]):
                 continue
             ts_short = self._format_ts_short(ts) if isinstance(ts, str) and ts.strip() else ""
             tag_u = tag.strip().upper()
+            content_norm = self._normalize_for_transcript(content)
             if tag_u in {"YOU", "AGENT", "SYSTEM", "ERROR"}:
                 prefix = f"[{tag_u}]"
                 if ts_short:
                     prefix = f"{prefix} {ts_short}"
-                chunks.append(f"{prefix} {content}\n\n")
+                chunks.append(f"{prefix} {content_norm}\n\n")
             else:
                 header = f"[{tag_u}]"
                 if ts_short:
                     header = f"{header} {ts_short}"
-                chunks.append(f"{header}\n{content}\n\n")
+                chunks.append(f"{header}\n{content_norm}\n\n")
         return "".join(chunks)
 
     def _append_entry(self, *, tag: str, content: str, block: bool) -> None:
@@ -253,13 +270,14 @@ class ChatApp(App[None]):
         ts_short = self._format_ts_short(ts_iso)
         tag_u = tag.strip().upper()
         self._history_entries.append({"ts": ts_iso, "tag": tag_u, "content": content})
+        content_norm = self._normalize_for_transcript(content)
         if tag_u in {"YOU", "AGENT", "SYSTEM", "ERROR"}:
-            self._append_raw(f"[{tag_u}] {ts_short} {content}\n\n")
+            self._append_raw(f"[{tag_u}] {ts_short} {content_norm}\n\n")
             return
         if block:
-            self._append_raw(f"[{tag_u}] {ts_short}\n{content}\n\n")
+            self._append_raw(f"[{tag_u}] {ts_short}\n{content_norm}\n\n")
         else:
-            self._append_raw(f"[{tag_u}] {ts_short} {content}\n\n")
+            self._append_raw(f"[{tag_u}] {ts_short} {content_norm}\n\n")
 
     def _write_temp_session(self) -> None:
         try:
@@ -288,22 +306,37 @@ class ChatApp(App[None]):
             Binding("ctrl+c", "copy", "Copy", show=True, priority=True),
         ]
 
-        async def _on_key(self, event: events.Key) -> None:
-            # TextArea inserts newlines in its internal _on_key(). Intercept here so:
-            # - Enter sends
-            # - Shift+Enter inserts newline
+        def _is_submit_shortcut(self, event: events.Key) -> bool:
             key = (event.key or "").lower()
-            if key == "shift+enter":
-                event.stop()
-                event.prevent_default()
-                self.insert("\n")
+            if key in {"ctrl+s", "ctrl+enter", "ctrl+kp_enter"}:
+                return True
+            mods = getattr(event, "modifiers", None)
+            if isinstance(mods, (set, list, tuple)):
+                if key in {"s"} and "ctrl" in mods:
+                    return True
+                if key in {"enter", "kp_enter"} and "ctrl" in mods:
+                    return True
+            return bool(getattr(event, "ctrl", False)) and key in {"s", "enter", "kp_enter"}
+
+        def _handle_submit(self, event: events.Key) -> bool:
+            # NOTE: Many terminals do not distinguish Shift+Enter from Enter, so we use
+            # Ctrl+S to submit reliably, and let Enter insert newlines naturally.
+            if not self._is_submit_shortcut(event):
+                return False
+            event.stop()
+            event.prevent_default()
+            text = self.text.strip()
+            self.text = ""
+            self.post_message(InputSubmitted(text))
+            return True
+
+        async def on_key(self, event: events.Key) -> None:
+            if self._handle_submit(event):
                 return
-            if key == "enter":
-                event.stop()
-                event.prevent_default()
-                text = self.text.strip()
-                self.text = ""
-                self.post_message(InputSubmitted(text))
+            await super().on_key(event)
+
+        async def _on_key(self, event: events.Key) -> None:
+            if self._handle_submit(event):
                 return
             await super()._on_key(event)
 
@@ -734,6 +767,15 @@ class ChatApp(App[None]):
         tag = entry.tag.strip().upper()
         content = entry.content or ""
 
+        def append_multiline(out: Text, s: str, *, style: str) -> None:
+            # In Rich, styles do not reliably carry across newline boundaries when
+            # appending a single string containing '\n'. Append line-by-line instead.
+            parts = s.splitlines(keepends=True)
+            if not parts:
+                return
+            for part in parts:
+                out.append(part, style=style)
+
         def chip(label: str, color: str) -> Text:
             return Text(f" {label} ", style=f"bold {t.bg} on {color}")
 
@@ -745,7 +787,7 @@ class ChatApp(App[None]):
             msg = Text()
             msg.append_text(chip("YOU", t.user))
             msg.append(" ")
-            msg.append(content, style=f"{t.user} on {msg_bg}")
+            append_multiline(msg, content, style=f"{t.user} on {msg_bg}")
             return msg
 
         if tag == "AGENT":
@@ -753,7 +795,7 @@ class ChatApp(App[None]):
             msg = Text()
             msg.append_text(chip("AGENT", t.agent))
             msg.append(" ")
-            msg.append(content, style=f"{t.fg} on {msg_bg}")
+            append_multiline(msg, content, style=f"{t.fg} on {msg_bg}")
             return msg
 
         if tag == "SYSTEM":
@@ -761,7 +803,7 @@ class ChatApp(App[None]):
             msg = Text()
             msg.append_text(chip("SYSTEM", t.dim))
             msg.append(" ")
-            msg.append(content, style=f"{t.dim} on {msg_bg}")
+            append_multiline(msg, content, style=f"{t.dim} on {msg_bg}")
             return msg
 
         if tag == "ERROR":
@@ -769,7 +811,7 @@ class ChatApp(App[None]):
             msg = Text()
             msg.append_text(chip("ERROR", t.error))
             msg.append(" ")
-            msg.append(content, style=f"{t.error} on {msg_bg}")
+            append_multiline(msg, content, style=f"{t.error} on {msg_bg}")
             return msg
 
         block_styles: dict[str, tuple[str, str]] = {
@@ -795,7 +837,7 @@ class ChatApp(App[None]):
             out = Text()
             out.append_text(box_title(label, color))
             out.append("\n")
-            out.append(content, style=f"{t.fg} on {body_bg}")
+            append_multiline(out, content, style=f"{t.fg} on {body_bg}")
             return out
 
         # Fallback: show untagged lines without extra styling.
@@ -861,8 +903,8 @@ class ChatApp(App[None]):
                         "/chat resume <name>",
                         "",
                         "Input:",
-                        "- Enter: send",
-                        "- Shift+Enter: newline",
+                        "- Enter: newline",
+                        "- Ctrl+S: send",
                         "- Ctrl+I: focus input",
                         "- Ctrl+L: focus log",
                         "- Ctrl+Q: quit",

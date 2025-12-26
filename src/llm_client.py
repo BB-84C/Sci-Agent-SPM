@@ -153,8 +153,10 @@ class OpenAiMultimodalClient:
     ) -> Mapping[str, Any]:
         narrator_system = (
             f"{system_prompt}\n\n"
-            "NARRATION MODE:\n"
-            "- Do not call any tools.\n"
+            "MESSAGE COMPOSITION MODE:\n"
+            "- You are only writing the user-facing narration for the NEXT TOOL CALL shown below.\n"
+            "- The runtime will execute the tool call; do NOT claim you cannot interact with the UI or cannot use tools.\n"
+            "- Do not request switching modes.\n"
             "- Return ONLY one JSON object.\n"
             '- JSON keys: "say" (required), "plan" (optional list), "observation" (optional), "rationale" (optional).\n'
             "- say: 1-2 short sentences describing what you will do now and what you will check next.\n"
