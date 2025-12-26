@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import ast
 import json
+import os
 import re
 import threading
+import shutil
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -175,6 +177,13 @@ class ChatApp(App[None]):
         color: #1DB45E;
         background: #0C0C0C;
     }
+    #cache {
+        width: 42;
+        content-align: left middle;
+        color: #1DB45E;
+        background: #0C0C0C;
+        padding: 0 1;
+    }
     """
 
     ENABLE_COMMAND_PALETTE = False
@@ -209,8 +218,15 @@ class ChatApp(App[None]):
         # Show full tool call/result payloads in the transcript (no truncation/collapse).
         self._truncate_tool_blocks: bool = False
         self._temp_session_path = Path("sessions") / ".temp_session.json"
+        self._current_session_name: Optional[str] = None
+        self._current_session_saved: bool = False
+        self._session_log_roots: set[str] = set()
+        self._cache_usage_inflight: bool = False
+        self._cache_usage_text: str = ""
 
     def on_unmount(self) -> None:
+        if not self._current_session_saved:
+            self._delete_log_roots(self._session_log_roots)
         self._clear_temp_session()
 
     def _clear_temp_session(self) -> None:
@@ -219,6 +235,113 @@ class ChatApp(App[None]):
                 self._temp_session_path.unlink()
         except Exception:
             pass
+
+    def _current_log_root(self) -> str:
+        try:
+            return str(self._agent.logger.run_root)
+        except Exception:
+            return ""
+
+    def _track_log_root(self, root: str) -> None:
+        root = str(root or "").strip()
+        if not root:
+            return
+        self._session_log_roots.add(root)
+
+    def _delete_log_roots(self, roots: Any) -> None:
+        try:
+            iterable = list(roots)
+        except Exception:
+            iterable = []
+        for r in set(str(x).strip() for x in iterable if str(x).strip()):
+            try:
+                p = Path(r)
+                if p.exists() and p.is_dir():
+                    shutil.rmtree(p, ignore_errors=True)
+            except Exception:
+                continue
+
+    def _reset_run_logger(self) -> None:
+        # Create a fresh log root for the next chat session.
+        try:
+            self._agent.set_log_dir(self._agent.config.log_dir)
+        except Exception:
+            pass
+        self._session_log_roots = set()
+        self._track_log_root(self._current_log_root())
+
+    def _format_bytes(self, n: int) -> str:
+        n = max(0, int(n))
+        units = ["B", "KB", "MB", "GB", "TB"]
+        x = float(n)
+        u = 0
+        while x >= 1024.0 and u < len(units) - 1:
+            x /= 1024.0
+            u += 1
+        if u == 0:
+            return f"{int(x)} {units[u]}"
+        return f"{x:.1f} {units[u]}"
+
+    def _dir_size_bytes(self, path: Path) -> int:
+        try:
+            if not path.exists() or not path.is_dir():
+                return 0
+        except Exception:
+            return 0
+        total = 0
+        try:
+            for root, _dirs, files in os.walk(str(path)):
+                for fn in files:
+                    try:
+                        fp = Path(root) / fn
+                        total += fp.stat().st_size
+                    except Exception:
+                        continue
+        except Exception:
+            return 0
+        return int(total)
+
+    def _cache_roots(self) -> set[Path]:
+        roots: set[Path] = {Path("logs")}
+        try:
+            roots.add(Path(self._agent.config.log_dir))
+        except Exception:
+            pass
+        return roots
+
+    def _request_cache_usage_update(self) -> None:
+        if self._cache_usage_inflight:
+            return
+        self._cache_usage_inflight = True
+
+        roots = list(self._cache_roots())
+        session_roots = [Path(x) for x in self._session_log_roots if isinstance(x, str) and x.strip()]
+
+        def compute() -> None:
+            total_bytes = 0
+            for r in roots:
+                total_bytes += self._dir_size_bytes(r)
+            session_bytes = 0
+            for r in session_roots:
+                session_bytes += self._dir_size_bytes(r)
+            text = f"Cache: {self._format_bytes(total_bytes)}"
+            if session_roots:
+                text += f" (session: {self._format_bytes(session_bytes)})"
+
+            def apply() -> None:
+                self._cache_usage_inflight = False
+                self._cache_usage_text = text
+                try:
+                    self.query_one("#cache", Static).update(text)
+                except Exception:
+                    pass
+
+            try:
+                self.call_from_thread(apply)
+            except Exception:
+                apply()
+
+        threading.Thread(target=compute, daemon=True).start()
 
     def _format_ts_short(self, ts_iso: str) -> str:
         try:
@@ -294,6 +417,7 @@ class ChatApp(App[None]):
                 # Prefer structured history. Keep the plain text for backwards compatibility.
                 "history": entries,
                 "history_text": history_text,
+                "log_roots": sorted(self._session_log_roots),
                 "agent": agent_state,
                 "tokens": agent_state.get("tokens", {}),
             }
@@ -391,6 +515,7 @@ class ChatApp(App[None]):
                     yield inp
 
             with Horizontal(id="underbar"):
+                yield Static("", id="cache")
                 yield Static("", id="underleft")
                 yield Static("", id="tokens")
 
@@ -402,6 +527,8 @@ class ChatApp(App[None]):
         self._append_system("Enter: send • Shift+Enter: newline • /help for commands")
         self._append_system("Safety: ESC abort hotkey • Mouse to top-left FAILSAFE")
         self._sync_tokens_from_agent()
+        self._track_log_root(self._current_log_root())
+        self._request_cache_usage_update()
         inp = self.query_one("#input", TextArea)
         inp.focus()
         self._resize_input_to_content()
@@ -886,6 +1013,7 @@ class ChatApp(App[None]):
                         "/chat save [name]",
                         "/chat list",
                         "/chat resume <name>",
+                        "/clear_cache",
                         "",
                         "Input:",
                         "- Enter: newline",
@@ -893,6 +1021,21 @@ class ChatApp(App[None]):
                         "- Ctrl+I: focus input",
                         "- Ctrl+L: focus log",
                         "- Ctrl+Q: quit",
+                    ]
+                ),
+            )
+            return True
+
+        if cmd == "/clear_cache":
+            self._confirm_mode = "clear_cache"
+            self._append_block(
+                "Confirm",
+                "\n".join(
+                    [
+                        "Clear all logs on disk?",
+                        "Type:",
+                        "  1 - Cancel",
+                        "  2 - Delete logs now",
                     ]
                 ),
             )
@@ -979,6 +1122,7 @@ class ChatApp(App[None]):
             try:
                 self._agent.set_log_dir(rest)
                 self._append_block("Log Dir", f"Log dir set to: {self._agent.config.log_dir}")
+                self._request_cache_usage_update()
             except Exception as e:
                 self._append_error(str(e))
             return True
@@ -1022,10 +1166,13 @@ class ChatApp(App[None]):
                     "workspace": str(self._agent.workspace.source_path),
                     "history": entries,
                     "history_text": history_text,
+                    "log_roots": sorted(self._session_log_roots),
                     "agent": agent_state,
                     "tokens": agent_state.get("tokens", {}),
                 }
                 save_session(name, state)
+                self._current_session_name = name
+                self._current_session_saved = True
                 self._append_block("Sessions", f"Saved: {name}")
                 return True
             if sub == "resume":
@@ -1072,6 +1219,15 @@ class ChatApp(App[None]):
                         self._sync_tokens_from_agent()
                 else:
                     self._sync_tokens_from_agent()
+                self._current_session_name = name
+                self._current_session_saved = True
+                self._session_log_roots = set()
+                loaded_roots = state.get("log_roots", None)
+                if isinstance(loaded_roots, list):
+                    for x in loaded_roots:
+                        if isinstance(x, str) and x.strip():
+                            self._session_log_roots.add(x.strip())
+                self._reset_run_logger()
                 self._append_block("Sessions", f"Resumed: {name}")
                 return True
             self._append_error("Usage: /chat save [name] | /chat list | /chat resume <name>")
@@ -1095,6 +1251,12 @@ class ChatApp(App[None]):
                 return
             if text == "2":
                 self._confirm_mode = None
+                if not self._current_session_saved:
+                    self._delete_log_roots(self._session_log_roots)
+                self._current_session_name = None
+                self._current_session_saved = False
+                self._reset_run_logger()
+                self._request_cache_usage_update()
                 # Clear transcript + reset agent memory, without saving.
                 self._history_display = []
                 self._history_full = []
@@ -1118,6 +1280,33 @@ class ChatApp(App[None]):
                 self._append_system("New session started. Use /chat save to save later; /help for commands.")
                 return
             self._append_error("Please type 1 (cancel) or 2 (start new session).")
+            return
+
+        if self._confirm_mode == "clear_cache":
+            if text == "1":
+                self._confirm_mode = None
+                self._append_block("Confirm", "Canceled.")
+                return
+            if text == "2":
+                self._confirm_mode = None
+                roots = {Path("logs"), Path(self._agent.config.log_dir)}
+                removed = 0
+                for root in roots:
+                    try:
+                        if not root.exists() or not root.is_dir():
+                            continue
+                        for child in root.iterdir():
+                            if child.is_dir():
+                                shutil.rmtree(child, ignore_errors=True)
+                                removed += 1
+                    except Exception:
+                        continue
+                self._session_log_roots = set()
+                self._reset_run_logger()
+                self._append_block("Cache", f"Deleted {removed} log directorie(s).")
+                self._request_cache_usage_update()
+                return
+            self._append_error("Please type 1 (cancel) or 2 (delete logs).")
             return
 
         if self._handle_slash(text):
@@ -1197,6 +1386,11 @@ class ChatApp(App[None]):
             return
         if t == "result":
             result = ev.get("result", {})
+            if isinstance(result, dict):
+                lr = result.get("log_root", None)
+                if isinstance(lr, str) and lr.strip():
+                    self._track_log_root(lr.strip())
+                    self._request_cache_usage_update()
             try:
                 rtxt = json.dumps({"tool": str(ev.get("action", "")), "result": result}, indent=2, ensure_ascii=False)
             except Exception:
