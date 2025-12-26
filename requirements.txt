@@ -4,3 +4,4 @@ pillow
 pynput
 openai
 textual
+mcp
