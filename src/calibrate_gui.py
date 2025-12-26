@@ -5,7 +5,7 @@ import ctypes
 import json
 import sys
 import tkinter as tk
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from tkinter import messagebox, ttk
 from typing import Any, Literal, Optional
@@ -50,6 +50,7 @@ class AnchorDraft:
     y: int = 0
     description: str = ""
     tags: str = ""
+    linked_rois: list[str] = field(default_factory=list)
 
     def to_json(self) -> dict[str, Any]:
         out: dict[str, Any] = {
@@ -61,6 +62,9 @@ class AnchorDraft:
         tags = [t.strip() for t in (self.tags or "").split(",") if t.strip()]
         if tags:
             out["tags"] = tags
+        linked = [str(x) for x in (self.linked_rois or []) if str(x).strip()]
+        if linked:
+            out["linked_ROIs"] = linked
         return out
 
 
@@ -136,6 +140,8 @@ class CalibratorApp(tk.Tk):
         self.anchors: list[AnchorDraft] = []
         for a in self.raw.get("anchors", []):
             if isinstance(a, dict):
+                linked = a.get("linked_ROIs", []) or []
+                linked_list = [str(x) for x in linked if isinstance(x, (str, int, float)) and str(x).strip()] if isinstance(linked, list) else []
                 self.anchors.append(
                     AnchorDraft(
                         name=str(a.get("name", "")),
@@ -143,6 +149,7 @@ class CalibratorApp(tk.Tk):
                         y=int(a.get("y", 0)),
                         description=str(a.get("description", "")),
                         tags=",".join(str(t) for t in (a.get("tags") or []) if isinstance(t, (str, int, float))),
+                        linked_rois=linked_list,
                     )
                 )
 
@@ -157,6 +164,7 @@ class CalibratorApp(tk.Tk):
         self._screen_bbox: tuple[int, int, int, int] = (0, 0, 0, 0)  # left, top, width, height
         self._scale: float = 1.0
         self._render_job: Optional[str] = None
+        self._suppress_form_events: bool = False
 
         self._build_ui()
         self._refresh_screenshot()
@@ -178,7 +186,7 @@ class CalibratorApp(tk.Tk):
         left.grid(row=0, column=0, sticky="nsw")
 
         ttk.Label(left, text="Items").grid(row=0, column=0, sticky="w")
-        self.items_list = tk.Listbox(left, width=36, height=28)
+        self.items_list = tk.Listbox(left, width=36, height=28, exportselection=False)
         self.items_list.grid(row=1, column=0, sticky="nsew")
         self.items_list.bind("<<ListboxSelect>>", lambda _e: self._on_select(populate_form=True))
 
@@ -214,14 +222,32 @@ class CalibratorApp(tk.Tk):
             ent = ttk.Entry(self.form, width=30)
             ent.configure(exportselection=False)
             ent.grid(row=i, column=1, sticky="ew", pady=2)
+            ent.bind("<KeyRelease>", lambda _e, f=field: self._on_form_changed(source=f))
+            ent.bind("<FocusOut>", lambda _e, f=field: self._on_form_changed(source=f))
             self._fields[field] = ent
 
         self.form.columnconfigure(1, weight=1)
 
-        apply_row = 1 + 7
-        ttk.Button(self.form, text="Apply changes", command=self._apply_form).grid(
-            row=apply_row, column=0, columnspan=2, sticky="ew", pady=(8, 0)
+        # Anchor-only: link ROIs that should be checked after using this anchor.
+        self._linked_frame = ttk.LabelFrame(self.form, text="Linked ROIs (anchor only)", padding=8)
+        self._linked_frame.grid(row=1 + 7, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+        self._linked_frame.columnconfigure(0, weight=1)
+
+        self._linked_roi_var = tk.StringVar(value="")
+        self._linked_roi_combo = ttk.Combobox(self._linked_frame, textvariable=self._linked_roi_var, state="readonly")
+        self._linked_roi_combo.grid(row=0, column=0, sticky="ew")
+        self._linked_add_btn = ttk.Button(self._linked_frame, text="Add", command=self._add_linked_roi)
+        self._linked_add_btn.grid(row=0, column=1, padx=(6, 0))
+
+        self._linked_list = tk.Listbox(
+            self._linked_frame, height=5, selectmode=tk.EXTENDED, exportselection=False
         )
+        self._linked_list.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        self._linked_remove_btn = ttk.Button(self._linked_frame, text="Remove selected", command=self._remove_linked_roi)
+        self._linked_remove_btn.grid(
+            row=2, column=0, columnspan=2, sticky="ew", pady=(6, 0)
+        )
+        self._set_linked_controls_enabled(False)
 
         right = ttk.Frame(self, padding=8)
         right.grid(row=0, column=1, sticky="nsew")
@@ -247,12 +273,72 @@ class CalibratorApp(tk.Tk):
         )
         ttk.Label(right, text=help_txt, justify="left").grid(row=1, column=0, sticky="ew", pady=(8, 0))
 
+        self._refresh_roi_options()
+
     def _refresh_list(self) -> None:
         self.items_list.delete(0, tk.END)
         for r in self.rois:
             self.items_list.insert(tk.END, f"[ROI] {r.name}")
         for a in self.anchors:
             self.items_list.insert(tk.END, f"[ANCHOR] {a.name}")
+        self._refresh_roi_options()
+
+    def _refresh_roi_options(self) -> None:
+        try:
+            values = [r.name for r in self.rois if r.name]
+            self._linked_roi_combo["values"] = values
+            if values and self._linked_roi_var.get() not in values:
+                self._linked_roi_var.set(values[0])
+            if not values:
+                self._linked_roi_var.set("")
+        except Exception:
+            pass
+
+    def _add_linked_roi(self) -> None:
+        name = (self._linked_roi_var.get() or "").strip()
+        if not name:
+            return
+        existing = set(self._linked_list.get(0, tk.END))
+        if name in existing:
+            return
+        self._linked_list.insert(tk.END, name)
+        self._on_form_changed(source="linked_rois")
+
+    def _remove_linked_roi(self) -> None:
+        sel = list(self._linked_list.curselection())
+        if not sel:
+            return
+        for idx in reversed(sel):
+            self._linked_list.delete(idx)
+        self._on_form_changed(source="linked_rois")
+
+    def _set_linked_rois_ui(self, values: list[str]) -> None:
+        self._linked_list.delete(0, tk.END)
+        for v in values:
+            if v:
+                self._linked_list.insert(tk.END, v)
+
+    def _set_linked_controls_enabled(self, enabled: bool) -> None:
+        try:
+            self._linked_frame.state(["!disabled"] if enabled else ["disabled"])
+        except Exception:
+            pass
+        try:
+            self._linked_roi_combo.configure(state="readonly" if enabled else "disabled")
+        except Exception:
+            pass
+        try:
+            self._linked_add_btn.state(["!disabled"] if enabled else ["disabled"])
+        except Exception:
+            pass
+        try:
+            self._linked_remove_btn.state(["!disabled"] if enabled else ["disabled"])
+        except Exception:
+            pass
+        try:
+            self._linked_list.configure(state=tk.NORMAL if enabled else tk.DISABLED)
+        except Exception:
+            pass
 
     def _selected(self) -> tuple[Optional[ItemKind], Optional[int]]:
         sel = self.items_list.curselection()
@@ -274,6 +360,7 @@ class CalibratorApp(tk.Tk):
             return
 
         if populate_form:
+            self._suppress_form_events = True
             if kind == "roi":
                 item = self.rois[idx]
                 self.kind_var.set("ROI (Observation)")
@@ -284,6 +371,8 @@ class CalibratorApp(tk.Tk):
                 self._set_field("h", str(item.h))
                 self._set_field("description", item.description)
                 self._set_field("tags", item.tags)
+                self._set_linked_controls_enabled(False)
+                self._set_linked_rois_ui([])
             else:
                 item = self.anchors[idx]
                 self.kind_var.set("Anchor (Action click point)")
@@ -294,6 +383,9 @@ class CalibratorApp(tk.Tk):
                 self._set_field("h", "")
                 self._set_field("description", item.description)
                 self._set_field("tags", item.tags)
+                self._set_linked_controls_enabled(True)
+                self._set_linked_rois_ui(list(item.linked_rois or []))
+            self._suppress_form_events = False
 
         if kind == "roi":
             self._draw_existing_roi(self.rois[idx])
@@ -305,34 +397,74 @@ class CalibratorApp(tk.Tk):
         ent.delete(0, tk.END)
         ent.insert(0, value)
 
-    def _apply_form(self) -> None:
+    def _try_int(self, value: str) -> Optional[int]:
+        s = (value or "").strip()
+        if not s:
+            return None
+        try:
+            return int(float(s))
+        except Exception:
+            return None
+
+    def _update_selected_list_label(self, *, kind: ItemKind, idx: int) -> None:
+        list_idx = idx if kind == "roi" else len(self.rois) + idx
+        label = f"[ROI] {self.rois[idx].name}" if kind == "roi" else f"[ANCHOR] {self.anchors[idx].name}"
+        try:
+            self.items_list.delete(list_idx)
+            self.items_list.insert(list_idx, label)
+            self.items_list.selection_clear(0, tk.END)
+            self.items_list.selection_set(list_idx)
+        except Exception:
+            pass
+
+    def _on_form_changed(self, *, source: str) -> None:
+        if self._suppress_form_events:
+            return
         kind, idx = self._selected()
         if kind is None or idx is None:
-            messagebox.showinfo("No selection", "Select an ROI or Anchor first.")
             return
-        try:
-            name = self._fields["name"].get().strip()
-            if not name:
-                raise ValueError("name is required")
-            x = _safe_int(self._fields["x"].get(), field="x")
-            y = _safe_int(self._fields["y"].get(), field="y")
-            description = self._fields["description"].get().strip()
-            tags = self._fields["tags"].get().strip()
-            if kind == "roi":
-                w = _safe_int(self._fields["w"].get(), field="w")
-                h = _safe_int(self._fields["h"].get(), field="h")
-                if w <= 0 or h <= 0:
-                    raise ValueError("ROI must have positive w/h")
-                self.rois[idx] = RoiDraft(name=name, x=x, y=y, w=w, h=h, description=description, tags=tags)
-            else:
-                self.anchors[idx] = AnchorDraft(name=name, x=x, y=y, description=description, tags=tags)
 
-            self._refresh_list()
-            self.items_list.selection_clear(0, tk.END)
-            self.items_list.selection_set(idx if kind == "roi" else len(self.rois) + idx)
-            self._on_select()
-        except Exception as e:
-            messagebox.showerror("Invalid values", str(e))
+        name_in = self._fields["name"].get().strip()
+        x_in = self._try_int(self._fields["x"].get())
+        y_in = self._try_int(self._fields["y"].get())
+        description_in = self._fields["description"].get()
+        tags_in = self._fields["tags"].get()
+
+        if kind == "roi":
+            cur = self.rois[idx]
+            w_in = self._try_int(self._fields["w"].get())
+            h_in = self._try_int(self._fields["h"].get())
+            self.rois[idx] = RoiDraft(
+                name=name_in or cur.name,
+                x=cur.x if x_in is None else x_in,
+                y=cur.y if y_in is None else y_in,
+                w=cur.w if (w_in is None or w_in <= 0) else w_in,
+                h=cur.h if (h_in is None or h_in <= 0) else h_in,
+                description=description_in,
+                tags=tags_in,
+            )
+            if source in {"name"}:
+                self._refresh_roi_options()
+                self._update_selected_list_label(kind="roi", idx=idx)
+            if source in {"x", "y", "w", "h"}:
+                self._clear_overlay()
+                self._draw_existing_roi(self.rois[idx])
+        else:
+            cur = self.anchors[idx]
+            linked = [str(v) for v in self._linked_list.get(0, tk.END) if str(v).strip()]
+            self.anchors[idx] = AnchorDraft(
+                name=name_in or cur.name,
+                x=cur.x if x_in is None else x_in,
+                y=cur.y if y_in is None else y_in,
+                description=description_in,
+                tags=tags_in,
+                linked_rois=linked,
+            )
+            if source in {"name"}:
+                self._update_selected_list_label(kind="anchor", idx=idx)
+            if source in {"x", "y"}:
+                self._clear_overlay()
+                self._draw_existing_anchor(self.anchors[idx])
 
     def _add_roi(self) -> None:
         existing = {r.name for r in self.rois}
@@ -359,7 +491,11 @@ class CalibratorApp(tk.Tk):
         if not messagebox.askyesno("Delete", "Delete selected item?"):
             return
         if kind == "roi":
-            self.rois.pop(idx)
+            removed = self.rois.pop(idx)
+            removed_name = (removed.name or "").strip()
+            if removed_name:
+                for a in self.anchors:
+                    a.linked_rois = [x for x in (a.linked_rois or []) if x != removed_name]
         else:
             self.anchors.pop(idx)
         self._refresh_list()
@@ -368,12 +504,14 @@ class CalibratorApp(tk.Tk):
     def _save(self) -> None:
         try:
             names: set[str] = set()
+            roi_names: set[str] = set()
             for r in self.rois:
                 if not r.name:
                     raise ValueError("ROI name cannot be empty")
                 if r.name in names:
                     raise ValueError(f"Duplicate name: {r.name!r}")
                 names.add(r.name)
+                roi_names.add(r.name)
                 if r.w <= 0 or r.h <= 0:
                     raise ValueError(f"ROI {r.name!r} must have positive w/h")
             for a in self.anchors:
@@ -382,6 +520,7 @@ class CalibratorApp(tk.Tk):
                 if a.name in names:
                     raise ValueError(f"Duplicate name: {a.name!r}")
                 names.add(a.name)
+                a.linked_rois = [x for x in (a.linked_rois or []) if x in roi_names]
 
             out = dict(self.raw)
             out["rois"] = [r.to_json() for r in self.rois]
@@ -528,13 +667,15 @@ class CalibratorApp(tk.Tk):
             sx, sy = self._canvas_to_screen(int(e.x), int(e.y))
             idx = self._drawing_item_index
             a = self.anchors[idx]
-            self.anchors[idx] = AnchorDraft(name=a.name, x=sx, y=sy, description=a.description, tags=a.tags)
+            self.anchors[idx] = AnchorDraft(
+                name=a.name, x=sx, y=sy, description=a.description, tags=a.tags, linked_rois=list(a.linked_rois or [])
+            )
             self._refresh_list()
             self.items_list.selection_clear(0, tk.END)
             self.items_list.selection_set(len(self.rois) + idx)
             self.mode = "idle"
             self._status("idle")
-            self._on_select(populate_form=False)
+            self._on_select(populate_form=True)
 
     def _on_mouse_move(self, e: tk.Event) -> None:
         if self.mode != "draw_roi" or self._draw_start is None or self._active_rect_id is None:
@@ -569,7 +710,7 @@ class CalibratorApp(tk.Tk):
         self.items_list.selection_set(idx)
         self.mode = "idle"
         self._status("idle")
-        self._on_select(populate_form=False)
+        self._on_select(populate_form=True)
 
 
 def main(argv: Optional[list[str]] = None) -> int:

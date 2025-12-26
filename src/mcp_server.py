@@ -63,23 +63,29 @@ def create_mcp_server(*, agent: Any) -> FastMCP:
 
     @mcp_tool(
         name="wait_until",
-        description="Wait for a UI condition by repeatedly checking a ROI screenshot.",
+        description="Wait for a UI condition by repeatedly checking one or more ROI screenshots.",
         meta={"category": "wait"},
     )
     def wait_until(
-        roi: str,
         seconds: float,
+        roi: Optional[str] = None,
+        rois: Optional[list[str]] = None,
         max_rounds: int = 10,
         max_total_seconds: int = 6 * 60 * 60,
         reason: Optional[str] = None,
     ) -> Literal["continue", "break"]:
         ctx = _ctx()
+        if rois is None and (roi is None or not str(roi).strip()):
+            raise ValueError("wait_until requires either 'roi' or 'rois'")
         action_input: dict[str, Any] = {
-            "roi": roi,
             "seconds": seconds,
             "max_rounds": max_rounds,
             "max_total_seconds": max_total_seconds,
         }
+        if rois is not None:
+            action_input["rois"] = rois
+        else:
+            action_input["roi"] = str(roi or "").strip()
         if reason is not None:
             action_input["reason"] = reason
         return tool_wait_until(
@@ -101,6 +107,13 @@ def create_mcp_server(*, agent: Any) -> FastMCP:
         action_input: dict[str, Any] = {"anchor": anchor}
         if rois is not None:
             action_input["rois"] = rois
+        else:
+            try:
+                linked = list(agent.workspace.anchor(anchor).linked_rois)
+            except Exception:
+                linked = []
+            if linked:
+                action_input["rois"] = linked
         return tool_click_anchor(
             agent,
             step_index=ctx.step_index,
@@ -125,6 +138,13 @@ def create_mcp_server(*, agent: Any) -> FastMCP:
         action_input: dict[str, Any] = {"anchor": anchor, "typed_text": typed_text, "submit": submit}
         if rois is not None:
             action_input["rois"] = rois
+        else:
+            try:
+                linked = list(agent.workspace.anchor(anchor).linked_rois)
+            except Exception:
+                linked = []
+            if linked:
+                action_input["rois"] = linked
         return tool_set_field(
             agent,
             step_index=ctx.step_index,

@@ -158,8 +158,10 @@ class OpenAiMultimodalClient:
             "- The runtime will execute the tool call; do NOT claim you cannot interact with the UI or cannot use tools.\n"
             "- Do not request switching modes.\n"
             "- Return ONLY one JSON object.\n"
-            '- JSON keys: "say" (required), "plan" (optional list), "observation" (optional), "rationale" (optional).\n'
+            '- JSON keys: "say" (required), "observation" (required), "plan" (optional list), "rationale" (optional).\n'
             "- say: 1-2 short sentences describing what you will do now and what you will check next.\n"
+            "- observation: 1 short sentence summarizing the most relevant current UI state for the user.\n"
+            "  If a numeric readout is visible in OBSERVATION, include the value.\n"
             "- rationale: 1 short sentence (no hidden chain-of-thought).\n"
         )
         try:

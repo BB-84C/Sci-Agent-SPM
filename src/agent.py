@@ -31,6 +31,8 @@ Keep any narration short (1–2 sentences). Do not reveal internal reasoning.
 Guidelines:
 - If the user asks to recalibrate ROIs/anchors, call the calibration tool.
 - Prefer observing relevant ROIs after taking actions.
+- If an anchor declares linked_ROIs, use those ROIs for post-action verification (and for deciding what to wait on).
+- If the user asks you to report a numeric readout (e.g., bias/current/countdown), do not finish until you have either reported the value(s) or explicitly said the ROI is unreadable and asked to recalibrate/expand it.
 - Avoid repeating actions without checking results. If the UI looks correct, stop using a terminal tool.
 
 IMPORTANT:
@@ -89,6 +91,8 @@ class VisualAutomationAgent:
         self._tokens_in: int = 0
         self._tokens_out: int = 0
         self._tokens_total: int = 0
+        self._last_readouts: dict[str, str] = {}
+        self._last_unreadable_readouts: list[str] = []
 
         self._mcp = create_mcp_server(agent=self)
         self._openai_tools_cache: Optional[list[dict[str, Any]]] = None
@@ -313,7 +317,12 @@ class VisualAutomationAgent:
 
     def _workspace_text(self) -> str:
         rois = "\n".join(f"- {r.name}: {r.description}" for r in self.workspace.rois) or "(none)"
-        anchors = "\n".join(f"- {a.name}: {a.description}" for a in self.workspace.anchors) or "(none)"
+        anchor_lines: list[str] = []
+        for a in self.workspace.anchors:
+            linked = ", ".join(a.linked_rois) if a.linked_rois else ""
+            suffix = f" (linked_ROIs: {linked})" if linked else ""
+            anchor_lines.append(f"- {a.name}: {a.description}{suffix}")
+        anchors = "\n".join(anchor_lines) or "(none)"
         return f"ROIs:\n{rois}\n\nAnchors:\n{anchors}"
 
     def _memory_text(self) -> str:
@@ -340,9 +349,18 @@ class VisualAutomationAgent:
     def _default_observation(self) -> tuple[str, list[tuple[str, str, Any]]]:
         # If the workspace has tool hints, prefer those ROIs; otherwise capture all ROIs.
         rois = [r.name for r in self.workspace.rois]
+        readout_lines: list[str] = []
+        for k, v in (self._last_readouts or {}).items():
+            if k and v:
+                readout_lines.append(f"- {k}: {v}")
+        for k in (self._last_unreadable_readouts or []):
+            if k:
+                readout_lines.append(f"- {k}: (unreadable; consider recalibrating/expanding this ROI)")
+        readouts_text = ("\nLast parsed readouts:\n" + "\n".join(readout_lines) + "\n") if readout_lines else ""
         obs_text = (
             f"Last action log: {self._last_action_log}\n"
             f"Available ROIs: {', '.join(rois)}\n"
+            f"{readouts_text}"
         )
         obs_text = f"{obs_text}\n\n{self._workspace_text()}"
         images = self._observe_images(rois)

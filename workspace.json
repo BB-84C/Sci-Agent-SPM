@@ -18,7 +18,7 @@
       "y": 51,
       "w": 63,
       "h": 56,
-      "description": "ROI covering scan status. It's an icon made of 2 balck bars. If the Icon is in balck, then it means the scanning is in progress. If the icon is in balck and has a squre gray shadow background, then it means the scanning is on paused. If the icon is in faded gray color, it means there's now scaning in progress.",
+      "description": "ROI covering scan status. It only tells the current status of scanning, if you need to get how long the scanning will take, refer to the scan time countdown ROI. It's an icon made of 2 balck bars. If the Icon is in balck, then it means the scanning is in progress. If the icon is in balck and has a squre gray shadow background, then it means the scanning is on paused. If the icon is in faded gray color, it means there's now scaning in progress.",
       "tags": [
         "status",
         "scan"
@@ -42,7 +42,7 @@
       "y": 153,
       "w": 239,
       "h": 87,
-      "description": "The scan time count down indicated the time that current scan needs to finish.",
+      "description": "The scan time count down indicated the time that current scan needs to finish. If you need to decide how long to wait for the scanning, refer to this ROI. ",
       "tags": [
         "readout",
         "scan_time_countdown"
@@ -58,6 +58,9 @@
       "tags": [
         "input",
         "bias"
+      ],
+      "linked_ROIs": [
+        "bias_readout"
       ]
     },
     {
@@ -68,6 +71,10 @@
       "tags": [
         "button",
         "scan from top"
+      ],
+      "linked_ROIs": [
+        "scan_status",
+        "scan_time_countdown_readout"
       ]
     },
     {
@@ -78,6 +85,10 @@
       "tags": [
         "button",
         "scan from bottom"
+      ],
+      "linked_ROIs": [
+        "scan_status",
+        "scan_time_countdown_readout"
       ]
     },
     {
@@ -88,6 +99,9 @@
       "tags": [
         "input",
         "current"
+      ],
+      "linked_ROIs": [
+        "current_readout"
       ]
     }
   ],

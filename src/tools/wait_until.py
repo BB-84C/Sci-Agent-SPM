@@ -15,11 +15,19 @@ _SLEEP_CAP_SECONDS = 6 * 60 * 60
 _DEFAULT_NEXT_SECONDS = 10
 
 
-def _require_roi_name(action_input: Mapping[str, Any]) -> str:
+def _coerce_roi_names(action_input: Mapping[str, Any]) -> list[str]:
+    """
+    Back-compat: support either {"roi": "..."} or {"rois": ["...","..."]}.
+    """
+    rois = action_input.get("rois", None)
+    if isinstance(rois, list):
+        names = [str(x).strip() for x in rois if isinstance(x, (str, int, float)) and str(x).strip()]
+        if names:
+            return names
     roi = action_input.get("roi", None)
-    if not isinstance(roi, str) or not roi.strip():
-        raise ValueError("wait_until requires action_input.roi (ROI name)")
-    return roi.strip()
+    if isinstance(roi, str) and roi.strip():
+        return [roi.strip()]
+    raise ValueError("wait_until requires action_input.roi (str) or action_input.rois (list[str])")
 
 
 def _require_nonneg_seconds(action_input: Mapping[str, Any], key: str) -> float:
@@ -84,10 +92,10 @@ def _choose_next_seconds(*, suggested: Optional[int]) -> int:
 def _llm_confirm_done(
     agent: "VisualAutomationAgent",
     *,
-    roi_name: str,
-    roi_description: str,
+    roi_names: list[str],
+    roi_descriptions: list[str],
     wait_reason: str,
-    img: Any,
+    images: list[tuple[str, Any]],
 ) -> Mapping[str, Any]:
     system = (
         "You decide whether to stop waiting by inspecting a UI ROI screenshot.\n"
@@ -95,12 +103,20 @@ def _llm_confirm_done(
         '{ "done": true|false, "reason": "<short>", "suggest_seconds": <int optional> }\n'
         "No markdown. No code fences. No extra text."
     )
+    roi_lines = []
+    for n, d in zip(roi_names, roi_descriptions):
+        roi_lines.append(f"- {n}: {d or '(none)'}")
+    roi_block = "\n".join(roi_lines) if roi_lines else "(none)"
     user = (
         "Is the awaited condition satisfied (i.e., should we stop waiting)?\n\n"
-        f"ROI name: {roi_name}\n"
-        f"ROI description: {roi_description or '(none)'}\n"
+        f"ROIs:\n{roi_block}\n"
         f"Wait reason: {wait_reason or '(none)'}\n"
     )
+
+    content: list[Mapping[str, Any]] = [{"type": "input_text", "text": user}]
+    for roi_name, img in images:
+        content.append({"type": "input_text", "text": f"ROI image: {roi_name}"})
+        content.append({"type": "input_image", "image_url": _img_to_data_url(img)})
 
     resp = agent.llm._client.responses.create(  # type: ignore[attr-defined]
         model=agent.llm._config.model,  # type: ignore[attr-defined]
@@ -108,10 +124,7 @@ def _llm_confirm_done(
             {"role": "system", "content": system},
             {
                 "role": "user",
-                "content": [
-                    {"type": "input_text", "text": user},
-                    {"type": "input_image", "image_url": _img_to_data_url(img)},
-                ],
+                "content": content,
             },
         ],
         timeout=agent.llm._config.timeout_s,  # type: ignore[attr-defined]
@@ -140,7 +153,7 @@ def handle(
 ) -> Literal["continue", "break"]:
     agent._consecutive_observes = 0
 
-    roi_name = _require_roi_name(action_input)
+    roi_names = _coerce_roi_names(action_input)
     seconds = _require_nonneg_seconds(action_input, "seconds")
     max_rounds = _optional_pos_int(action_input, "max_rounds", _DEFAULT_MAX_ROUNDS)
     max_total_seconds = _require_nonneg_seconds(
@@ -149,18 +162,28 @@ def handle(
     )
     wait_reason = str(action_input.get("reason", "")).strip()
 
-    try:
-        roi = agent.workspace.roi(roi_name)
-    except KeyError as e:
-        step = agent.logger.start_step(f"wait_until_{roi_name}_invalid")
-        meta = {"tool": "wait_until", "reason": "invalid_roi", "roi": roi_name, "error": str(e)}
+    resolved: list[Any] = []
+    missing: list[str] = []
+    for name in roi_names:
+        try:
+            resolved.append(agent.workspace.roi(name))
+        except KeyError:
+            missing.append(name)
+    if missing:
+        step = agent.logger.start_step("wait_until_invalid")
+        meta = {"tool": "wait_until", "reason": "invalid_roi", "rois": roi_names, "missing": missing}
         step.write_meta(meta)
-        result = {"reason": "wait_until_invalid_roi", "roi": roi_name, "log_root": str(agent.logger.run_root)}
+        result = {
+            "reason": "wait_until_invalid_roi",
+            "rois": roi_names,
+            "missing": missing,
+            "log_root": str(agent.logger.run_root),
+        }
         results.append({"action": "wait_until", "action_input": dict(action_input), "result": result, "say": say})
         agent._emit("result", step=step_index, action="wait_until", result=result)
         return "continue"
 
-    roi_description = getattr(roi, "description", "") or ""
+    roi_descriptions = [getattr(roi, "description", "") or "" for roi in resolved]
 
     total_waited = 0.0
     rounds_used = 0
@@ -168,7 +191,7 @@ def handle(
     last_step_rel = ""
     last_sleep_s = 0.0
 
-    agent.logger.narrate(f"[WaitUntil] Waiting on ROI {roi_name!r}.")
+    agent.logger.narrate(f"[WaitUntil] Waiting on ROI(s): {', '.join(roi_names)}.")
 
     for r in range(1, max_rounds + 1):
         rounds_used = r
@@ -178,7 +201,8 @@ def handle(
 
         sleep_s = min(float(seconds), remaining, float(_SLEEP_CAP_SECONDS))
         last_sleep_s = float(sleep_s)
-        step = agent.logger.start_step(f"wait_until_{roi_name}_r{r}")
+        roi_label = roi_names[0] if len(roi_names) == 1 else f"{roi_names[0]}+{len(roi_names) - 1}"
+        step = agent.logger.start_step(f"wait_until_{roi_label}_r{r}")
         last_step_rel = str(step.path.relative_to(agent.logger.run_root))
 
         if sleep_s > 0:
@@ -188,28 +212,35 @@ def handle(
         else:
             agent.logger.narrate(f"[WaitUntil] Round {r}/{max_rounds}: checking now…")
 
-        img = agent.capturer.capture_roi(roi)
-        img_name = f"after_{roi_name}.png"
-        step.save_image(img_name, img)
-        last_image_rel = str((step.path / img_name).relative_to(agent.logger.run_root))
+        captured: list[tuple[str, Any]] = []
+        last_images: dict[str, str] = {}
+        for roi_name, roi in zip(roi_names, resolved):
+            img = agent.capturer.capture_roi(roi)
+            img_name = f"after_{roi_name}.png"
+            step.save_image(img_name, img)
+            rel = str((step.path / img_name).relative_to(agent.logger.run_root))
+            last_images[roi_name] = rel
+            captured.append((roi_name, img))
+        # Keep compatibility with older consumers expecting a single "last_image".
+        last_image_rel = last_images.get(roi_names[0], "")
 
         llm_error = ""
         confirm: Mapping[str, Any] = {}
         try:
             confirm = _llm_confirm_done(
                 agent,
-                roi_name=roi_name,
-                roi_description=roi_description,
+                roi_names=roi_names,
+                roi_descriptions=roi_descriptions,
                 wait_reason=wait_reason,
-                img=img,
+                images=captured,
             )
         except Exception as e:
             llm_error = str(e)
 
         meta: dict[str, Any] = {
             "tool": "wait_until",
-            "roi": roi_name,
-            "roi_description": roi_description,
+            "rois": roi_names,
+            "roi_descriptions": roi_descriptions,
             "round": r,
             "max_rounds": max_rounds,
             "requested_seconds": float(seconds),
@@ -217,7 +248,7 @@ def handle(
             "total_waited_seconds": float(total_waited),
             "max_total_seconds": float(max_total_seconds),
             "reason": wait_reason,
-            "image": img_name,
+            "images": {k: f"after_{k}.png" for k in roi_names},
         }
         if llm_error:
             meta["llm_error"] = llm_error
@@ -229,16 +260,17 @@ def handle(
 
         if bool(confirm.get("done", False)):
             result: dict[str, Any] = {
-                "roi": roi_name,
+                "rois": roi_names,
                 "final_seconds": float(last_sleep_s),
                 "rounds_used": rounds_used,
                 "total_waited_seconds": float(total_waited),
                 "log_root": str(agent.logger.run_root),
                 "last_step": last_step_rel,
                 "last_image": last_image_rel,
+                "last_images": last_images,
                 "llm_reason": str(confirm.get("reason", "")).strip(),
             }
-            agent._last_action_log = f"wait_until(roi={roi_name}, seconds={float(last_sleep_s):.1f})"
+            agent._last_action_log = f"wait_until(rois={roi_names}, seconds={float(last_sleep_s):.1f})"
             agent._last_action_signature = signature
             agent._observed_since_last_action = False
             results.append({"action": "wait_until", "action_input": dict(action_input), "result": result, "say": say})
@@ -255,7 +287,7 @@ def handle(
 
     fail_result: dict[str, Any] = {
         "reason": fail_reason,
-        "roi": roi_name,
+        "rois": roi_names,
         "rounds_used": rounds_used,
         "total_waited_seconds": float(total_waited),
         "log_root": str(agent.logger.run_root),
@@ -265,7 +297,7 @@ def handle(
     if fail_reason == "wait_until_llm_error":
         fail_result["llm_error"] = str(llm_error_val)
 
-    agent._last_action_log = f"wait_until(roi={roi_name}, failed=true)"
+    agent._last_action_log = f"wait_until(rois={roi_names}, failed=true)"
     agent._last_action_signature = signature
     agent._observed_since_last_action = False
     results.append({"action": "wait_until", "action_input": dict(action_input), "result": fail_result, "say": say})

@@ -184,6 +184,9 @@ class ChatApp(App[None]):
         ("ctrl+l", "focus_transcript", "Log"),
         ("ctrl+i", "focus_input", "Input"),
         ("ctrl+shift+c", "copy_mode", "Select/Copy"),
+        Binding("ctrl+s", "submit_input", "Send", show=True, priority=True),
+        Binding("ctrl+enter", "submit_input", show=False, priority=True),
+        Binding("ctrl+kp_enter", "submit_input", show=False, priority=True),
         ("pageup", "scroll_up", "Up"),
         ("pagedown", "scroll_down", "Down"),
     ]
@@ -305,40 +308,6 @@ class ChatApp(App[None]):
             Binding("ctrl+a", "select_all", "Select all", show=True, priority=True),
             Binding("ctrl+c", "copy", "Copy", show=True, priority=True),
         ]
-
-        def _is_submit_shortcut(self, event: events.Key) -> bool:
-            key = (event.key or "").lower()
-            if key in {"ctrl+s", "ctrl+enter", "ctrl+kp_enter"}:
-                return True
-            mods = getattr(event, "modifiers", None)
-            if isinstance(mods, (set, list, tuple)):
-                if key in {"s"} and "ctrl" in mods:
-                    return True
-                if key in {"enter", "kp_enter"} and "ctrl" in mods:
-                    return True
-            return bool(getattr(event, "ctrl", False)) and key in {"s", "enter", "kp_enter"}
-
-        def _handle_submit(self, event: events.Key) -> bool:
-            # NOTE: Many terminals do not distinguish Shift+Enter from Enter, so we use
-            # Ctrl+S to submit reliably, and let Enter insert newlines naturally.
-            if not self._is_submit_shortcut(event):
-                return False
-            event.stop()
-            event.prevent_default()
-            text = self.text.strip()
-            self.text = ""
-            self.post_message(InputSubmitted(text))
-            return True
-
-        async def on_key(self, event: events.Key) -> None:
-            if self._handle_submit(event):
-                return
-            await super().on_key(event)
-
-        async def _on_key(self, event: events.Key) -> None:
-            if self._handle_submit(event):
-                return
-            await super()._on_key(event)
 
     class Transcript(RichLog):
         BINDINGS = [
@@ -476,10 +445,12 @@ class ChatApp(App[None]):
         inputbox = self.query_one("#inputbox", Horizontal)
         inputbar = self.query_one("#inputbar", Horizontal)
 
-        # Use the actual content width to estimate wrapped lines.
-        width = int(getattr(inp.content_size, "width", 0))
+        # Estimate wrapped lines using the *viewport* width, not the content width.
+        # (content_size.width can grow with long lines and cause undercounting, which
+        # then renders wrapped text outside the input box.)
+        width = int(getattr(getattr(inp, "size", None), "width", 0))
         if width <= 0:
-            width = max(20, int(getattr(self.size, "width", 120)) - 12)
+            width = max(20, int(getattr(getattr(self, "size", None), "width", 120)) - 12)
 
         def line_len(s: str) -> int:
             return len(s.replace("\t", "    "))
@@ -502,6 +473,7 @@ class ChatApp(App[None]):
         inputbar.styles.height = outer_h
         inputbar.styles.min_height = outer_h
         inputbar.styles.max_height = outer_h
+        self.refresh(layout=True)
 
     def _append_raw(self, text: str) -> None:
         self._history_full.append(text)
@@ -856,6 +828,16 @@ class ChatApp(App[None]):
     def action_focus_input(self) -> None:
         self._input().focus()
 
+    def action_submit_input(self) -> None:
+        inp = self._input()
+        text = (inp.text or "").strip()
+        if not text:
+            return
+        inp.text = ""
+        self._resize_input_to_content()
+        inp.focus()
+        self._send(text)
+
     def action_copy_mode(self) -> None:
         self.push_screen(self.TranscriptCopyScreen(text=self._get_transcript_plain_text()))
 
@@ -1178,11 +1160,13 @@ class ChatApp(App[None]):
         if t == "idle":
             self.busy = False
             self._set_status("Ready")
+            self.action_focus_input()
             return
         if t == "error":
             self._append_error(str(ev.get("text", "")))
             self.busy = False
             self._set_status("Ready")
+            self.action_focus_input()
             return
         if t == "plan":
             plan = ev.get("plan", None)

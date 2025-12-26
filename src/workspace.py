@@ -27,6 +27,7 @@ class Anchor:
     y: int
     description: str = ""
     tags: tuple[str, ...] = ()
+    linked_rois: tuple[str, ...] = ()
 
     def as_point(self) -> tuple[int, int]:
         return (self.x, self.y)
@@ -103,9 +104,18 @@ def load_workspace(path: str | Path) -> Workspace:
         )
 
     anchors: list[Anchor] = []
+    roi_names = {r.name for r in rois}
     for item in anchors_raw:
         if not isinstance(item, dict):
             raise ValueError("Each anchor must be an object")
+        linked_raw = item.get("linked_ROIs", None)
+        linked: tuple[str, ...] = ()
+        if isinstance(linked_raw, list):
+            linked = tuple(str(x) for x in linked_raw if isinstance(x, (str, int, float)) and str(x).strip())
+        elif linked_raw is not None:
+            linked = (str(linked_raw).strip(),) if str(linked_raw).strip() else ()
+        # Keep only ROIs that exist (calibrator enforces this, but workspace files may drift).
+        linked = tuple(x for x in linked if x in roi_names)
         anchors.append(
             Anchor(
                 name=str(item.get("name", "")),
@@ -113,6 +123,7 @@ def load_workspace(path: str | Path) -> Workspace:
                 y=_require_int(item, "y"),
                 description=str(item.get("description", "")),
                 tags=_parse_tags(item.get("tags")),
+                linked_rois=linked,
             )
         )
 
@@ -126,4 +137,3 @@ def load_workspace(path: str | Path) -> Workspace:
             raise ValueError("Anchor 'name' is required")
 
     return Workspace(rois=tuple(rois), anchors=tuple(anchors), tools=tools_raw, source_path=p)
-
