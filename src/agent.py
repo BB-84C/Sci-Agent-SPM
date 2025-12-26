@@ -40,7 +40,8 @@ IMPORTANT:
 
 @dataclass(frozen=True, slots=True)
 class AgentConfig:
-    model: str = "gpt-5.2"
+    agent_model: str = "gpt-5.2"
+    tool_call_model: str = "gpt-5.2"
     max_steps: int = 10
     action_delay_s: float = 0.25
     log_dir: str = "logs"
@@ -71,7 +72,10 @@ class VisualAutomationAgent:
             abort_event=abort.event if abort else None,
         )
 
-        self.llm = OpenAiMultimodalClient(LlmConfig(model=config.model))
+        self.llm_agent = OpenAiMultimodalClient(LlmConfig(model=config.agent_model))
+        self.llm_tool = OpenAiMultimodalClient(LlmConfig(model=config.tool_call_model))
+        # Back-compat alias used by some tool implementations.
+        self.llm = self.llm_agent
 
         self._last_action_log: str = "(none yet)"
         self._memory: list[str] = []
@@ -96,14 +100,23 @@ class VisualAutomationAgent:
             pass
 
     def set_model(self, model: str) -> None:
+        # Backwards compatibility: treat `/model` as `/agent_model`.
+        self.set_agent_model(model)
+
+    def set_agent_model(self, model: str) -> None:
         model = model.strip()
         if not model:
-            raise ValueError("Model name cannot be empty.")
-        self.config = replace(self.config, model=model)
-        try:
-            self.llm._config = replace(self.llm._config, model=model)  # type: ignore[attr-defined]
-        except Exception:
-            self.llm = OpenAiMultimodalClient(LlmConfig(model=model))
+            raise ValueError("Agent model name cannot be empty.")
+        self.config = replace(self.config, agent_model=model)
+        self.llm_agent = OpenAiMultimodalClient(LlmConfig(model=model))
+        self.llm = self.llm_agent
+
+    def set_tool_call_model(self, model: str) -> None:
+        model = model.strip()
+        if not model:
+            raise ValueError("Tool-call model name cannot be empty.")
+        self.config = replace(self.config, tool_call_model=model)
+        self.llm_tool = OpenAiMultimodalClient(LlmConfig(model=model))
 
     def set_max_steps(self, max_steps: int) -> None:
         max_steps = int(max_steps)
@@ -177,8 +190,8 @@ class VisualAutomationAgent:
             total_tokens=self._tokens_total,
         )
 
-    def _accumulate_last_usage(self) -> None:
-        usage = getattr(self.llm, "last_usage", None)
+    def _accumulate_last_usage(self, client: Optional[OpenAiMultimodalClient] = None) -> None:
+        usage = getattr(client or self.llm, "last_usage", None)
         if not isinstance(usage, dict):
             return
         try:
@@ -302,7 +315,9 @@ class VisualAutomationAgent:
         except Exception:
             pass
         self.logger.narrate(f"Workspace: {self.workspace.source_path}")
-        self.logger.narrate(f"Agent mode: True (model={self.config.model})")
+        self.logger.narrate(
+            f"Agent mode: True (agent_model={self.config.agent_model}, tool_call_model={self.config.tool_call_model})"
+        )
         self.logger.narrate("Failsafe: move mouse to top-left to abort (pyautogui.FAILSAFE)")
         if self.config.abort_hotkey:
             self.logger.narrate("Abort hotkey: ESC")
@@ -332,14 +347,14 @@ class VisualAutomationAgent:
         plan: list[str] = []
         planned_steps: list[dict[str, Any]] = []
         try:
-            plan_out = self.llm.plan_step(
+            plan_out = self.llm_agent.plan_step(
                 system_prompt=SYSTEM_PROMPT,
                 user_prompt=user_command,
                 memory_text=self._memory_text(),
                 workspace_text=self._workspace_text(),
                 tools_text=tool_schemas_text(),
             )
-            self._accumulate_last_usage()
+            self._accumulate_last_usage(self.llm_agent)
             raw_plan = plan_out.get("plan", None)
             if isinstance(raw_plan, list) and all(isinstance(x, str) for x in raw_plan):
                 plan = [x.strip() for x in raw_plan if x.strip()]
@@ -383,7 +398,7 @@ class VisualAutomationAgent:
                         action = str(cur.get("tool", "")).strip()
                         action_input = dict(cur.get("args", {}) if isinstance(cur.get("args", {}), dict) else {})
                 else:
-                    model_out = self.llm.react_step(
+                    model_out = self.llm_tool.react_step(
                         system_prompt=SYSTEM_PROMPT,
                         user_prompt=f"USER COMMAND: {user_command}",
                         memory_text=self._memory_text(),
@@ -392,7 +407,7 @@ class VisualAutomationAgent:
                         observation_images=obs_images,
                         tools=openai_tools,
                     )
-                    self._accumulate_last_usage()
+                    self._accumulate_last_usage(self.llm_tool)
 
                     tool_calls = model_out.get("tool_calls", [])
                     if not isinstance(tool_calls, list) or not tool_calls:
@@ -430,7 +445,7 @@ class VisualAutomationAgent:
                 observation_summary = ""
                 rationale = ""
                 try:
-                    narration = self.llm.narrate_tool_call(
+                    narration = self.llm_agent.narrate_tool_call(
                         system_prompt=SYSTEM_PROMPT,
                         user_command=user_command,
                         plan_text="\n".join(f"- {x}" for x in plan) if plan else "(none)",
@@ -439,7 +454,7 @@ class VisualAutomationAgent:
                         tool_name=action,
                         tool_args=action_input,
                     )
-                    self._accumulate_last_usage()
+                    self._accumulate_last_usage(self.llm_agent)
                 except Exception:
                     narration = {}
 

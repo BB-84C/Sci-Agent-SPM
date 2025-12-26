@@ -826,6 +826,8 @@ class ChatApp(App[None]):
             "CONFIRM": ("CONFIRM", t.accent),
             "WORKSPACE": ("WORKSPACE", t.dim),
             "MODEL": ("MODEL", t.dim),
+            "AGENT MODEL": ("AGENT MODEL", t.dim),
+            "TOOL CALL MODEL": ("TOOL CALL MODEL", t.dim),
             "MAX AGENT STEPS": ("MAX AGENT STEPS", t.dim),
             "ACTION DELAY": ("ACTION DELAY", t.dim),
             "ABORT HOTKEY": ("ABORT HOTKEY", t.dim),
@@ -892,7 +894,8 @@ class ChatApp(App[None]):
                     [
                         "/help or /menu",
                         "/workspace [path]",
-                        "/model [name]",
+                        "/agent_model [name]",
+                        "/tool_call_model [name]",
                         "/max_agent_steps [int]",
                         "/action_delay [seconds]",
                         "/abort_hotkey [on|off]",
@@ -924,13 +927,24 @@ class ChatApp(App[None]):
                 self._append_error(str(e))
             return True
 
-        if cmd == "/model":
+        if cmd in {"/agent_model", "/agent-model", "/model"}:
             if not rest:
-                self._append_block("Model", f"Current model: {self._agent.config.model}")
+                self._append_block("Agent Model", f"Current agent model: {self._agent.config.agent_model}")
                 return True
             try:
-                self._agent.set_model(rest)
-                self._append_block("Model", f"Model set to: {self._agent.config.model}")
+                self._agent.set_agent_model(rest)
+                self._append_block("Agent Model", f"Agent model set to: {self._agent.config.agent_model}")
+            except Exception as e:
+                self._append_error(str(e))
+            return True
+
+        if cmd in {"/tool_call_model", "/tool-call-model"}:
+            if not rest:
+                self._append_block("Tool Call Model", f"Current tool-call model: {self._agent.config.tool_call_model}")
+                return True
+            try:
+                self._agent.set_tool_call_model(rest)
+                self._append_block("Tool Call Model", f"Tool-call model set to: {self._agent.config.tool_call_model}")
             except Exception as e:
                 self._append_error(str(e))
             return True
