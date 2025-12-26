@@ -2,8 +2,6 @@ from __future__ import annotations
 
 from typing import Any, Mapping, Optional, TYPE_CHECKING, Literal
 
-from ..llm_client import _extract_json_object, _img_to_data_url
-
 if TYPE_CHECKING:
     from ..agent import VisualAutomationAgent
 
@@ -17,46 +15,6 @@ def _is_readout_roi(agent: "VisualAutomationAgent", name: str) -> bool:
     d = (roi.description or "").lower()
     tags = [str(t).lower() for t in (roi.tags or ())]
     return ("readout" in n) or ("readout" in d) or ("readout" in tags)
-
-
-def _llm_extract_readouts(
-    agent: "VisualAutomationAgent",
-    *,
-    roi_names: list[str],
-    roi_descriptions: list[str],
-    images: list[tuple[str, Any]],
-) -> Mapping[str, Any]:
-    system = (
-        "You extract UI readout values from ROI screenshots.\n"
-        "Return ONLY one JSON object with exactly these keys:\n"
-        '{ "values": { "<roi_name>": "<value string or null>" }, "unreadable": ["<roi_name>"], "reason": "<short>" }\n'
-        "Rules:\n"
-        "- If a value cannot be read confidently, set it to null and include the ROI name in unreadable.\n"
-        "- Keep value strings concise and include units when visible (e.g., '700 mV', '50 pA').\n"
-        "- No markdown. No code fences. No extra text."
-    )
-    lines = []
-    for n, d in zip(roi_names, roi_descriptions):
-        lines.append(f"- {n}: {d or '(none)'}")
-    user = "Extract the current readout value(s) from these ROI images.\n\nROIs:\n" + "\n".join(lines)
-
-    content: list[Mapping[str, Any]] = [{"type": "input_text", "text": user}]
-    for roi_name, img in images:
-        content.append({"type": "input_text", "text": f"ROI image: {roi_name}"})
-        content.append({"type": "input_image", "image_url": _img_to_data_url(img)})
-
-    resp = agent.llm._client.responses.create(  # type: ignore[attr-defined]
-        model=agent.llm._config.model,  # type: ignore[attr-defined]
-        input=[
-            {"role": "system", "content": system},
-            {"role": "user", "content": content},
-        ],
-        timeout=agent.llm._config.timeout_s,  # type: ignore[attr-defined]
-    )
-    agent.llm._set_last_usage(resp)  # type: ignore[attr-defined]
-    agent._accumulate_last_usage()
-    text = getattr(resp, "output_text", None) or ""
-    return _extract_json_object(text)
 
 
 def handle(
@@ -81,14 +39,10 @@ def handle(
         roi_objs = [agent.workspace.roi(n) for n in readout_names]
         roi_descs = [getattr(r, "description", "") or "" for r in roi_objs]
         img_map = {n: img for (n, _d, img) in images}
-        readout_images = [(n, img_map[n]) for n in readout_names if n in img_map]
+        readout_items = [(n, roi_descs[readout_names.index(n)], img_map[n]) for n in readout_names if n in img_map]
         try:
-            extracted = _llm_extract_readouts(
-                agent,
-                roi_names=readout_names,
-                roi_descriptions=roi_descs,
-                images=readout_images,
-            )
+            extracted = agent.llm_tool.extract_readouts(roi_items=readout_items)
+            agent._accumulate_last_usage(agent.llm_tool)
             vals = extracted.get("values", {})
             if isinstance(vals, dict):
                 for k, v in vals.items():

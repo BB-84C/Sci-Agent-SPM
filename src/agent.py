@@ -600,6 +600,51 @@ class VisualAutomationAgent:
                     step_ptr += 1
                 if flow == "break":
                     break
+            else:
+                # Step limit reached without a terminal tool: assess progress and finish gracefully.
+                obs_text, _obs_images = self._default_observation()
+                executed = results[-8:]
+                executed_lines: list[str] = []
+                for r in executed:
+                    try:
+                        executed_lines.append(
+                            f"- {str(r.get('action', ''))} args={str(r.get('action_input', {}))} say={str(r.get('say', '')).strip()}"
+                        )
+                    except Exception:
+                        continue
+                executed_text = "\n".join(executed_lines) if executed_lines else "(none)"
+                assessment_say = (
+                    f"Reached the maximum of {self.config.max_steps} steps before finishing. "
+                    "I will stop here and report the current progress. "
+                    "If you want me to continue, increase /max_agent_steps or ask me to proceed."
+                )
+                try:
+                    plan_text = "\n".join(f"- {x}" for x in plan) if plan else "(none)"
+                    assess = self.llm_agent.assess_step_limit(
+                        system_prompt=SYSTEM_PROMPT,
+                        user_command=user_command,
+                        plan_text=plan_text,
+                        memory_text=self._memory_text(),
+                        observation_text=obs_text,
+                        executed_steps_text=executed_text,
+                        max_steps=int(self.config.max_steps),
+                    )
+                    self._accumulate_last_usage(self.llm_agent)
+                    assessment_say = str(assess.get("say", "")).strip() or assessment_say
+                except Exception:
+                    pass
+                assessment_say = f"Stopped: reached max agent steps ({self.config.max_steps}). {assessment_say}".strip()
+
+                finish_name = "finish" if "finish" in known_tools else terminal_tool
+                finish_sig = self._call_signature(tool_name=finish_name, tool_args={})
+                self._call_mcp_tool(
+                    tool_name=finish_name,
+                    tool_args={},
+                    step_index=int(self.config.max_steps),
+                    say=assessment_say,
+                    signature=finish_sig,
+                    results=results,
+                )
         finally:
             if self._abort is not None:
                 self._abort.stop()

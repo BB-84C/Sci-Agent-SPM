@@ -18,22 +18,22 @@
       "y": 51,
       "w": 63,
       "h": 56,
-      "description": "ROI covering scan status. It only tells the current status of scanning, if you need to get how long the scanning will take, refer to the scan time countdown ROI. It's an icon made of 2 balck bars. If the Icon is in balck, then it means the scanning is in progress. If the icon is in balck and has a squre gray shadow background, then it means the scanning is on paused. If the icon is in faded gray color, it means there's now scaning in progress.",
+      "description": "ROI covering scan status. It only tells the current status of scanning, if you need to get how long the scanning will take, refer to the scan time countdown ROI. It's an icon made of 2 black bars. If the Icon is in black, then it means the scanning is in progress. If the icon is in black and has a square gray shadow background, then it means the scanning is on paused. If the icon is in faded gray color, it means there's now scanning in progress.",
       "tags": [
         "status",
         "scan"
       ]
     },
     {
-      "name": "current_readout",
+      "name": "set_current_readout",
       "x": 18,
-      "y": 758,
-      "w": 704,
-      "h": 100,
-      "description": "ROI covering the displayed current value (A) in Nanonis.",
+      "y": 759,
+      "w": 123,
+      "h": 92,
+      "description": "ROI covering the displayed set current value (A) in Nanonis. It does not always equal to the real current. Since this set current is only used in the constant-current-scanning mode to set the current that STM tries to maintain. But the actual real current depends on the tip's microscopical geometry and the electronic status. ",
       "tags": [
         "readout",
-        "current"
+        "set current"
       ]
     },
     {
@@ -46,6 +46,17 @@
       "tags": [
         "readout",
         "scan_time_countdown"
+      ]
+    },
+    {
+      "name": "real_current_readout",
+      "x": 534,
+      "y": 763,
+      "w": 159,
+      "h": 88,
+      "description": "ROI covering the displayed real current value (A) in Nanonis.",
+      "tags": [
+        "readout real current"
       ]
     }
   ],
@@ -92,7 +103,7 @@
       ]
     },
     {
-      "name": "current_input",
+      "name": "set_current_input",
       "x": 79,
       "y": 822,
       "description": "Anchor point of current input box. Remember the unit \"A\" embedded in the box is not part of the input value. For example, if you need to input 50pA, return either \"0.000000000005\" or \"50p\" the cap of this input is 10nA.",
@@ -101,7 +112,7 @@
         "current"
       ],
       "linked_ROIs": [
-        "current_readout"
+        "set_current_readout"
       ]
     }
   ],

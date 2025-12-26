@@ -6,6 +6,17 @@ if TYPE_CHECKING:
     from ..agent import VisualAutomationAgent
 
 
+def _is_readout_roi(agent: "VisualAutomationAgent", name: str) -> bool:
+    try:
+        roi = agent.workspace.roi(name)
+    except Exception:
+        return False
+    n = (roi.name or "").lower()
+    d = (roi.description or "").lower()
+    tags = [str(t).lower() for t in (roi.tags or ())]
+    return ("readout" in n) or ("readout" in d) or ("readout" in tags)
+
+
 def _clear_focused_field(agent: "VisualAutomationAgent", anchor: Any) -> None:
     actor = agent.actor
     # Robust field clearing: different apps/controls support different selection semantics.
@@ -59,6 +70,28 @@ def handle(
     after_imgs = agent._observe_images(roi_names)
     for roi_name, _desc, img in after_imgs:
         step.save_image(f"after_{roi_name}.png", img)
+
+    # Update last parsed readouts opportunistically from any readout ROIs we just captured.
+    try:
+        readout_items = [(n, d, img) for (n, d, img) in after_imgs if _is_readout_roi(agent, n)]
+        if readout_items:
+            extracted = agent.llm_tool.extract_readouts(roi_items=[(n, d, img) for (n, d, img) in readout_items])
+            agent._accumulate_last_usage(agent.llm_tool)
+            vals = extracted.get("values", {})
+            unread = extracted.get("unreadable", [])
+            readouts: dict[str, str] = {}
+            if isinstance(vals, dict):
+                for k, v in vals.items():
+                    ks = str(k).strip()
+                    if ks and v is not None:
+                        readouts[ks] = str(v).strip()
+            merged = dict(getattr(agent, "_last_readouts", {}) or {})
+            merged.update({k: v for k, v in readouts.items() if k and v})
+            agent._last_readouts = merged
+            if isinstance(unread, list):
+                agent._last_unreadable_readouts = [str(x).strip() for x in unread if str(x).strip()]
+    except Exception:
+        pass
 
     step.write_meta(
         {

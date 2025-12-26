@@ -88,6 +88,48 @@ class OpenAiMultimodalClient:
             total = max(0, in_tok + out_tok)
         self.last_usage = {"input_tokens": in_tok, "output_tokens": out_tok, "total_tokens": total}
 
+    def extract_readouts(
+        self,
+        *,
+        roi_items: list[tuple[str, str, Image.Image]],
+    ) -> Mapping[str, Any]:
+        """
+        Extract readout values from ROI screenshots.
+
+        Returns a JSON dict:
+          { "values": { "<roi_name>": "<value string or null>" }, "unreadable": ["<roi_name>"], "reason": "<short>" }
+        """
+        system = (
+            "You extract UI readout values from ROI screenshots.\n"
+            "Return ONLY one JSON object with exactly these keys:\n"
+            '{ "values": { "<roi_name>": "<value string or null>" }, "unreadable": ["<roi_name>"], "reason": "<short>" }\n'
+            "Rules:\n"
+            "- If a value cannot be read confidently, set it to null and include the ROI name in unreadable.\n"
+            "- Keep value strings concise and include units when visible (e.g., '700 mV', '50 pA').\n"
+            "- No markdown. No code fences. No extra text."
+        )
+        lines = []
+        for n, d, _img in roi_items:
+            lines.append(f"- {n}: {d or '(none)'}")
+        user = "Extract the current readout value(s) from these ROI images.\n\nROIs:\n" + ("\n".join(lines) if lines else "(none)")
+
+        content: list[dict[str, Any]] = [{"type": "input_text", "text": user}]
+        for roi_name, _desc, img in roi_items:
+            content.append({"type": "input_text", "text": f"ROI image: {roi_name}"})
+            content.append({"type": "input_image", "image_url": _img_to_data_url(img)})
+
+        resp = self._client.responses.create(
+            model=self._config.model,
+            input=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": content},
+            ],
+            timeout=self._config.timeout_s,
+        )
+        self._set_last_usage(resp)
+        text = getattr(resp, "output_text", None) or ""
+        return _extract_json_object(text)
+
     def react_step(
         self,
         *,
@@ -224,6 +266,50 @@ class OpenAiMultimodalClient:
                 {"role": "user", "content": [{"type": "input_text", "text": full_user}]},
             ],
             tool_choice="none",
+            timeout=self._config.timeout_s,
+        )
+        self._set_last_usage(resp)
+        text = getattr(resp, "output_text", None) or ""
+        return _extract_json_object(text)
+
+    def assess_step_limit(
+        self,
+        *,
+        system_prompt: str,
+        user_command: str,
+        plan_text: str,
+        memory_text: str,
+        observation_text: str,
+        executed_steps_text: str,
+        max_steps: int,
+    ) -> Mapping[str, Any]:
+        assessor_system = (
+            f"{system_prompt}\n\n"
+            "STEP LIMIT ASSESSMENT MODE:\n"
+            "- The run hit the max step limit before a terminal tool was called.\n"
+            "- Decide whether this looks like a loop/stall or simply a long task.\n"
+            "- Return ONLY one JSON object.\n"
+            '- JSON keys: "category" (required; one of "loop"|"too_long"|"unclear"), '
+            '"progress" (required; short), "next" (required; short), "say" (required; 1-3 sentences to user).\n'
+            "- Do not reveal hidden chain-of-thought.\n"
+        )
+        full_user = (
+            f"USER COMMAND: {user_command}\n\n"
+            f"MAX STEPS: {max_steps}\n\n"
+            f"SESSION MEMORY (recent):\n{memory_text}\n\n"
+            f"PLAN:\n{plan_text}\n\n"
+            f"CURRENT OBSERVATION:\n{observation_text}\n\n"
+            f"EXECUTED STEPS (recent):\n{executed_steps_text}\n\n"
+            "Return ONLY valid JSON."
+        )
+        resp = self._client.responses.create(
+            model=self._config.model,
+            input=[
+                {"role": "system", "content": assessor_system},
+                {"role": "user", "content": [{"type": "input_text", "text": full_user}]},
+            ],
+            tool_choice="none",
+            max_output_tokens=350,
             timeout=self._config.timeout_s,
         )
         self._set_last_usage(resp)
