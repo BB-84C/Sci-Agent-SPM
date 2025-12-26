@@ -346,6 +346,49 @@ class VisualAutomationAgent:
             out.append((name, roi.description, self.capturer.capture_roi(roi)))
         return out
 
+    def _is_readout_roi(self, name: str) -> bool:
+        try:
+            roi = self.workspace.roi(name)
+        except Exception:
+            return False
+        n = (roi.name or "").lower()
+        d = (roi.description or "").lower()
+        tags = [str(t).lower() for t in (roi.tags or ())]
+        return ("readout" in n) or ("readout" in d) or ("readout" in tags)
+
+    def _refresh_parsed_readouts_from_images(self, images: list[tuple[str, str, Any]]) -> None:
+        readout_items = [(n, d, img) for (n, d, img) in images if self._is_readout_roi(n)]
+        if not readout_items:
+            return
+        try:
+            extracted = self.llm_tool.extract_readouts(roi_items=readout_items)
+            self._accumulate_last_usage(self.llm_tool)
+        except Exception:
+            return
+
+        vals = extracted.get("values", {})
+        unread = extracted.get("unreadable", [])
+
+        merged = dict(getattr(self, "_last_readouts", {}) or {})
+        if isinstance(vals, dict):
+            for k, v in vals.items():
+                ks = str(k).strip()
+                if not ks:
+                    continue
+                if v is None:
+                    continue
+                merged[ks] = str(v).strip()
+
+        unread_list: list[str] = []
+        if isinstance(unread, list):
+            unread_list = [str(x).strip() for x in unread if str(x).strip()]
+        # Avoid stale values: if a readout is flagged unreadable, drop any prior value.
+        for k in unread_list:
+            merged.pop(k, None)
+
+        self._last_readouts = merged
+        self._last_unreadable_readouts = unread_list
+
     def _default_observation(self) -> tuple[str, list[tuple[str, str, Any]]]:
         # If the workspace has tool hints, prefer those ROIs; otherwise capture all ROIs.
         rois = [r.name for r in self.workspace.rois]
@@ -357,13 +400,21 @@ class VisualAutomationAgent:
             if k:
                 readout_lines.append(f"- {k}: (unreadable; consider recalibrating/expanding this ROI)")
         readouts_text = ("\nLast parsed readouts:\n" + "\n".join(readout_lines) + "\n") if readout_lines else ""
-        obs_text = (
-            f"Last action log: {self._last_action_log}\n"
-            f"Available ROIs: {', '.join(rois)}\n"
-            f"{readouts_text}"
-        )
-        obs_text = f"{obs_text}\n\n{self._workspace_text()}"
         images = self._observe_images(rois)
+        # Keep parsed readouts in sync with the current ROI screenshots so narration doesn't repeat stale values.
+        self._refresh_parsed_readouts_from_images(images)
+
+        readout_lines = []
+        for k, v in (self._last_readouts or {}).items():
+            if k and v:
+                readout_lines.append(f"- {k}: {v}")
+        for k in (self._last_unreadable_readouts or []):
+            if k:
+                readout_lines.append(f"- {k}: (unreadable; consider recalibrating/expanding this ROI)")
+        readouts_text = ("\nLast parsed readouts:\n" + "\n".join(readout_lines) + "\n") if readout_lines else ""
+
+        obs_text = f"Last action log: {self._last_action_log}\nAvailable ROIs: {', '.join(rois)}\n{readouts_text}"
+        obs_text = f"{obs_text}\n\n{self._workspace_text()}"
         return obs_text, images
 
     def _log_observation(
@@ -496,6 +547,7 @@ class VisualAutomationAgent:
                     raise ValueError(f"Unknown tool requested by model: {action!r}")
 
                 signature = self._call_signature(tool_name=action, tool_args=action_input)
+                plan_exhausted = bool(planned_steps) and step_ptr >= len(planned_steps)
 
                 # Generic loop-avoidance: if the model repeats the exact same tool call while the UI
                 # (as seen via ROIs) hasn't changed, re-ask once for a different call; otherwise stop.
@@ -554,25 +606,42 @@ class VisualAutomationAgent:
                 plan_block = None
                 observation_summary = ""
                 rationale = ""
-                try:
-                    narration = self.llm_agent.narrate_tool_call(
-                        system_prompt=SYSTEM_PROMPT,
-                        user_command=user_command,
-                        plan_text="\n".join(f"- {x}" for x in plan) if plan else "(none)",
-                        memory_text=self._memory_text(),
-                        observation_text=obs_text,
-                        tool_name=action,
-                        tool_args=action_input,
-                    )
-                    self._accumulate_last_usage(self.llm_agent)
-                except Exception:
-                    narration = {}
+                if plan_exhausted and action == terminal_tool and not action_input:
+                    parts: list[str] = []
+                    for k, v in (self._last_readouts or {}).items():
+                        if k and v:
+                            parts.append(f"{k}={v}")
+                        if len(parts) >= 4:
+                            break
+                    if self._last_unreadable_readouts:
+                        parts.append(f"unreadable={', '.join(self._last_unreadable_readouts[:3])}")
+                    readouts_inline = "; ".join(parts) if parts else ""
+                    say = "All planned steps are complete. Finishing now."
+                    if readouts_inline:
+                        say = f"{say} Final readouts: {readouts_inline}."
+                    observation_summary = say
+                    rationale = "Planned tool steps are complete, so the run can stop."
+                    plan_block = []
+                else:
+                    try:
+                        narration = self.llm_agent.narrate_tool_call(
+                            system_prompt=SYSTEM_PROMPT,
+                            user_command=user_command,
+                            plan_text="\n".join(f"- {x}" for x in plan) if plan else "(none)",
+                            memory_text=self._memory_text(),
+                            observation_text=obs_text,
+                            tool_name=action,
+                            tool_args=action_input,
+                        )
+                        self._accumulate_last_usage(self.llm_agent)
+                    except Exception:
+                        narration = {}
 
-                say = str(narration.get("say", "")).strip() or action
-                if isinstance(narration.get("plan", None), list) and all(isinstance(x, str) for x in narration["plan"]):
-                    plan_block = [x.strip() for x in narration["plan"] if isinstance(x, str) and x.strip()]
-                observation_summary = str(narration.get("observation", "")).strip()
-                rationale = str(narration.get("rationale", "")).strip()
+                    say = str(narration.get("say", "")).strip() or action
+                    if isinstance(narration.get("plan", None), list) and all(isinstance(x, str) for x in narration["plan"]):
+                        plan_block = [x.strip() for x in narration["plan"] if isinstance(x, str) and x.strip()]
+                    observation_summary = str(narration.get("observation", "")).strip()
+                    rationale = str(narration.get("rationale", "")).strip()
 
                 self.logger.narrate(f"[Agent] Step {i}/{self.config.max_steps}: {say}")
                 self._remember(f"Agent: {say}")
