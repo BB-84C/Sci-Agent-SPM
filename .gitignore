@@ -7,3 +7,4 @@ __pycache__/
 logs/
 workspace.local.json
 sessions/
+workspace.json
