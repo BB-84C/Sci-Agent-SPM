@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import re
 import time
 from dataclasses import dataclass, replace
 from typing import Any, Callable, Iterable, Literal, Mapping, Optional
@@ -94,15 +93,6 @@ class VisualAutomationAgent:
         self._tokens_total: int = 0
         self._last_readouts: dict[str, str] = {}
         self._last_unreadable_readouts: list[str] = []
-        self._pending_confirm_readout_rois: list[str] = []
-        self._pending_confirm_attempts: int = 0
-        self._pending_confirm_for_action: str = ""
-        self._pending_confirm_tool_name: str = ""
-        self._pending_confirm_tool_args: dict[str, Any] = {}
-        self._pending_confirm_signature: Optional[str] = None
-        self._pending_confirm_expected: dict[str, dict[str, Any]] = {}
-        self._pending_confirm_force_fix: bool = False
-        self._pending_confirm_last_check: dict[str, Any] = {}
 
         self._mcp = create_mcp_server(agent=self)
         self._openai_tools_cache: Optional[list[dict[str, Any]]] = None
@@ -366,149 +356,6 @@ class VisualAutomationAgent:
         tags = [str(t).lower() for t in (roi.tags or ())]
         return ("readout" in n) or ("readout" in d) or ("readout" in tags)
 
-    def _pending_confirmation_satisfied(self) -> bool:
-        rois = list(self._pending_confirm_readout_rois or [])
-        if not rois:
-            return True
-        last_vals = self._last_readouts or {}
-        unread = set(self._last_unreadable_readouts or [])
-        for roi_name in rois:
-            if roi_name in unread:
-                return False
-            val = last_vals.get(roi_name, "")
-            if not isinstance(val, str) or not val.strip():
-                return False
-        return True
-
-    _SI_PREFIX_SCALE: Mapping[str, float] = {
-        "p": 1e-12,
-        "n": 1e-9,
-        "u": 1e-6,
-        "µ": 1e-6,
-        "μ": 1e-6,
-        "m": 1e-3,
-        "": 1.0,
-        "k": 1e3,
-        "K": 1e3,
-        "M": 1e6,
-        "G": 1e9,
-    }
-    _NUMBER_UNIT_RE = re.compile(r"^\s*([+-]?\d+(?:\.\d+)?)\s*([a-zA-Zµμ]*)\s*$")
-
-    def _infer_base_unit(self, *, roi_name: str, value_str: str) -> Optional[str]:
-        s = (value_str or "").strip()
-        if "V" in s:
-            return "V"
-        if "A" in s:
-            return "A"
-        # Heuristic fallback: infer from ROI metadata.
-        try:
-            roi = self.workspace.roi(roi_name)
-            meta = f"{roi.name} {roi.description} {' '.join(str(t) for t in (roi.tags or ())) }".lower()
-        except Exception:
-            meta = roi_name.lower()
-        if "bias" in meta or "(v)" in meta or "volt" in meta:
-            return "V"
-        if "current" in meta or "(a)" in meta or "amp" in meta:
-            return "A"
-        if "countdown" in meta or "time" in meta or "(s)" in meta:
-            return "s"
-        return None
-
-    def _parse_quantity_to_base(self, *, roi_name: str, value_str: str, default_base: Optional[str] = None) -> Optional[tuple[float, str]]:
-        m = self._NUMBER_UNIT_RE.match((value_str or "").strip().replace(" ", ""))
-        if not m:
-            return None
-        try:
-            number = float(m.group(1))
-        except Exception:
-            return None
-        unit_tok = m.group(2) or ""
-        # Determine base unit from token or fallback.
-        base = None
-        if "V" in unit_tok:
-            base = "V"
-        elif "A" in unit_tok:
-            base = "A"
-        elif "s" in unit_tok and ("V" not in unit_tok) and ("A" not in unit_tok):
-            base = "s"
-        if base is None:
-            base = default_base or self._infer_base_unit(roi_name=roi_name, value_str=value_str)
-        if base is None:
-            return None
-
-        # Pull prefix: allow full unit like mV/pA or prefix-only like "500p".
-        prefix = ""
-        if unit_tok:
-            if base in unit_tok:
-                prefix = unit_tok.replace(base, "")
-            else:
-                # unit_tok is prefix-only.
-                prefix = unit_tok
-        prefix = prefix.strip()
-        scale = self._SI_PREFIX_SCALE.get(prefix, None)
-        if scale is None:
-            return None
-        return number * float(scale), base
-
-    def _quantity_close(self, *, base_unit: str, expected: float, observed: float) -> bool:
-        diff = abs(float(observed) - float(expected))
-        rel = diff / max(abs(float(expected)), abs(float(observed)), 1e-12)
-        if base_unit == "V":
-            return diff <= 0.01 or rel <= 0.02
-        if base_unit == "A":
-            return diff <= 5e-12 or rel <= 0.05
-        if base_unit == "s":
-            return diff <= 1.0 or rel <= 0.1
-        return rel <= 0.05
-
-    def _pending_confirmation_check(self) -> Mapping[str, Any]:
-        rois = list(self._pending_confirm_readout_rois or [])
-        unread = set(self._last_unreadable_readouts or [])
-        vals = self._last_readouts or {}
-
-        missing_or_unreadable: list[str] = []
-        mismatches: list[dict[str, Any]] = []
-
-        for roi_name in rois:
-            if roi_name in unread:
-                missing_or_unreadable.append(roi_name)
-                continue
-            observed_str = vals.get(roi_name, "")
-            if not isinstance(observed_str, str) or not observed_str.strip():
-                missing_or_unreadable.append(roi_name)
-                continue
-
-            expected_meta = (self._pending_confirm_expected or {}).get(roi_name, None)
-            if not isinstance(expected_meta, dict):
-                continue
-            expected_base = expected_meta.get("expected_base", None)
-            base_unit = expected_meta.get("base_unit", None)
-            if not isinstance(expected_base, (int, float)) or not isinstance(base_unit, str) or not base_unit:
-                continue
-            parsed_obs = self._parse_quantity_to_base(roi_name=roi_name, value_str=observed_str, default_base=base_unit)
-            if not parsed_obs:
-                missing_or_unreadable.append(roi_name)
-                continue
-            observed_base, obs_unit = parsed_obs
-            if obs_unit != base_unit:
-                missing_or_unreadable.append(roi_name)
-                continue
-            if not self._quantity_close(base_unit=base_unit, expected=float(expected_base), observed=float(observed_base)):
-                mismatches.append(
-                    {
-                        "roi": roi_name,
-                        "expected_from": str(expected_meta.get("expected_from", "")).strip(),
-                        "expected_base": float(expected_base),
-                        "base_unit": base_unit,
-                        "observed": observed_str.strip(),
-                        "observed_base": float(observed_base),
-                    }
-                )
-
-        ok = (not missing_or_unreadable) and (not mismatches)
-        return {"ok": ok, "unreadable": missing_or_unreadable, "mismatches": mismatches}
-
     def _refresh_parsed_readouts_from_images(self, images: list[tuple[str, str, Any]]) -> None:
         readout_items = [(n, d, img) for (n, d, img) in images if self._is_readout_roi(n)]
         if not readout_items:
@@ -599,15 +446,6 @@ class VisualAutomationAgent:
         openai_tools = self._openai_tools()
         known_tools = {t.get("name") for t in openai_tools}
         terminal_tool = self._pick_terminal_tool_name()
-        self._pending_confirm_readout_rois = []
-        self._pending_confirm_attempts = 0
-        self._pending_confirm_for_action = ""
-        self._pending_confirm_tool_name = ""
-        self._pending_confirm_tool_args = {}
-        self._pending_confirm_signature = None
-        self._pending_confirm_expected = {}
-        self._pending_confirm_force_fix = False
-        self._pending_confirm_last_check = {}
 
         def tool_schemas_text() -> str:
             parts: list[str] = []
@@ -673,165 +511,37 @@ class VisualAutomationAgent:
                     rois=[{"name": n, "description": d} for (n, d, _img) in obs_images],
                 )
 
-                # If we can't confirm required readout ROIs, keep re-observing instead of proceeding.
-                internal_retry = False
-                internal_fix = False
-                if self._pending_confirm_readout_rois:
-                    check = self._pending_confirmation_check()
-                    if bool(check.get("ok", False)):
-                        self._pending_confirm_readout_rois = []
-                        self._pending_confirm_attempts = 0
-                        self._pending_confirm_for_action = ""
-                        self._pending_confirm_tool_name = ""
-                        self._pending_confirm_tool_args = {}
-                        self._pending_confirm_signature = None
-                        self._pending_confirm_expected = {}
-                        self._pending_confirm_force_fix = False
-                        self._pending_confirm_last_check = {}
-                    else:
-                        mismatches = check.get("mismatches", [])
-                        if (not isinstance(mismatches, list) or not mismatches) and self._pending_confirm_force_fix:
-                            # If we recently saw a mismatch on an observe tool result, prefer fixing (retrying the last action)
-                            # even if the current full-screen parse is noisy/unreadable.
-                            last_mm = (self._pending_confirm_last_check or {}).get("mismatches", [])
-                            if isinstance(last_mm, list) and last_mm:
-                                mismatches = last_mm
-                        if isinstance(mismatches, list) and mismatches:
-                            if self._pending_confirm_attempts >= 5:
-                                finish_name = "finish" if "finish" in known_tools else terminal_tool
-                                action_label = self._pending_confirm_for_action or "(previous action)"
-                                mm_lines: list[str] = []
-                                for mm in mismatches[:3]:
-                                    try:
-                                        mm_lines.append(
-                                            f"{mm.get('roi')}: expected ~{mm.get('expected_base')} {mm.get('base_unit')}, observed {mm.get('observed')}"
-                                        )
-                                    except Exception:
-                                        continue
-                                mm_text = "; ".join(mm_lines) if mm_lines else "(mismatch)"
-                                say = (
-                                    "Aborting: unable to confirm the last action matches the intended value after 5 retries. "
-                                    f"Action: {action_label}. Mismatch: {mm_text}. "
-                                    "Please recalibrate ROIs or adjust the setting manually, then retry."
-                                )
-                                finish_sig = self._call_signature(tool_name=finish_name, tool_args={})
-                                self._call_mcp_tool(
-                                    tool_name=finish_name,
-                                    tool_args={},
-                                    step_index=i,
-                                    say=say,
-                                    signature=finish_sig,
-                                    results=results,
-                                )
-                                break
-                            # Retry the last tool call that we are trying to confirm.
-                            if not self._pending_confirm_tool_name or self._pending_confirm_tool_name not in known_tools:
-                                finish_name = "finish" if "finish" in known_tools else terminal_tool
-                                action_label = self._pending_confirm_for_action or "(previous action)"
-                                say = (
-                                    "Aborting: confirmation detected a readout mismatch, but the agent cannot retry the "
-                                    "previous tool call (missing tool context). "
-                                    f"Action: {action_label}."
-                                )
-                                finish_sig = self._call_signature(tool_name=finish_name, tool_args={})
-                                self._call_mcp_tool(
-                                    tool_name=finish_name,
-                                    tool_args={},
-                                    step_index=i,
-                                    say=say,
-                                    signature=finish_sig,
-                                    results=results,
-                                )
-                                break
-                            self._pending_confirm_attempts += 1
-                            internal_fix = True
-                            self._pending_confirm_force_fix = True
-                            action = self._pending_confirm_tool_name
-                            action_input = dict(self._pending_confirm_tool_args or {})
-                        elif self._pending_confirm_attempts >= 5:
-                            finish_name = "finish" if "finish" in known_tools else terminal_tool
-                            pending = ", ".join(self._pending_confirm_readout_rois)
-                            action_label = self._pending_confirm_for_action or "(previous action)"
-                            say = (
-                                "Aborting: unable to confirm the last action via readout ROIs after 5 retries. "
-                                f"Action: {action_label}. Unreadable/missing ROIs: {pending}. "
-                                "Please recalibrate/expand these ROIs and retry."
-                            )
-                            finish_sig = self._call_signature(tool_name=finish_name, tool_args={})
-                            self._call_mcp_tool(
-                                tool_name=finish_name,
-                                tool_args={},
-                                step_index=i,
-                                say=say,
-                                signature=finish_sig,
-                                results=results,
-                            )
-                            break
-                        if "observe" not in known_tools:
-                            finish_name = "finish" if "finish" in known_tools else terminal_tool
-                            pending = ", ".join(self._pending_confirm_readout_rois)
-                            action_label = self._pending_confirm_for_action or "(previous action)"
-                            say = (
-                                "Aborting: the agent needs to re-observe to confirm the last action, but the 'observe' "
-                                "tool is unavailable. "
-                                f"Action: {action_label}. ROIs: {pending}."
-                            )
-                            finish_sig = self._call_signature(tool_name=finish_name, tool_args={})
-                            self._call_mcp_tool(
-                                tool_name=finish_name,
-                                tool_args={},
-                                step_index=i,
-                                say=say,
-                                signature=finish_sig,
-                                results=results,
-                            )
-                            break
-                        internal_retry = True
-                        self._pending_confirm_attempts += 1
-                        action = "observe"
-                        action_input: dict[str, Any] = {"rois": list(self._pending_confirm_readout_rois)}
-
-                consumed_planned_step = False
                 if planned_steps:
-                    if not internal_retry and not internal_fix:
-                        if step_ptr >= len(planned_steps):
-                            action = terminal_tool
-                            action_input = {}
-                        else:
-                            cur = planned_steps[step_ptr]
-                            action = str(cur.get("tool", "")).strip()
-                            action_input = dict(
-                                cur.get("args", {}) if isinstance(cur.get("args", {}), dict) else {}
-                            )
-                            consumed_planned_step = True
+                    if step_ptr >= len(planned_steps):
+                        action = terminal_tool
+                        action_input: dict[str, Any] = {}
+                    else:
+                        cur = planned_steps[step_ptr]
+                        action = str(cur.get("tool", "")).strip()
+                        action_input = dict(cur.get("args", {}) if isinstance(cur.get("args", {}), dict) else {})
                 else:
-                    if not internal_retry and not internal_fix:
-                        model_out = self.llm_tool.react_step(
-                            system_prompt=SYSTEM_PROMPT,
-                            user_prompt=f"USER COMMAND: {user_command}",
-                            memory_text=self._memory_text(),
-                            plan_text="\n".join(f"- {x}" for x in plan) if plan else "(none)",
-                            observation_text=obs_text,
-                            observation_images=obs_images,
-                            tools=openai_tools,
-                        )
-                        self._accumulate_last_usage(self.llm_tool)
+                    model_out = self.llm_tool.react_step(
+                        system_prompt=SYSTEM_PROMPT,
+                        user_prompt=f"USER COMMAND: {user_command}",
+                        memory_text=self._memory_text(),
+                        plan_text="\n".join(f"- {x}" for x in plan) if plan else "(none)",
+                        observation_text=obs_text,
+                        observation_images=obs_images,
+                        tools=openai_tools,
+                    )
+                    self._accumulate_last_usage(self.llm_tool)
 
-                        tool_calls = model_out.get("tool_calls", [])
-                        if not isinstance(tool_calls, list) or not tool_calls:
-                            tool_calls = [{"name": terminal_tool, "arguments": {}}]
-                        tool_call = (
-                            tool_calls[0]
-                            if isinstance(tool_calls[0], dict)
-                            else {"name": terminal_tool, "arguments": {}}
-                        )
+                    tool_calls = model_out.get("tool_calls", [])
+                    if not isinstance(tool_calls, list) or not tool_calls:
+                        tool_calls = [{"name": terminal_tool, "arguments": {}}]
+                    tool_call = (
+                        tool_calls[0]
+                        if isinstance(tool_calls[0], dict)
+                        else {"name": terminal_tool, "arguments": {}}
+                    )
 
-                        action = str(tool_call.get("name", "")).strip()
-                        action_input = (
-                            tool_call.get("arguments", {})
-                            if isinstance(tool_call.get("arguments", {}), dict)
-                            else {}
-                        )
+                    action = str(tool_call.get("name", "")).strip()
+                    action_input = tool_call.get("arguments", {}) if isinstance(tool_call.get("arguments", {}), dict) else {}
 
                 if action not in known_tools:
                     raise ValueError(f"Unknown tool requested by model: {action!r}")
@@ -842,9 +552,7 @@ class VisualAutomationAgent:
                 # Generic loop-avoidance: if the model repeats the exact same tool call while the UI
                 # (as seen via ROIs) hasn't changed, re-ask once for a different call; otherwise stop.
                 if (
-                    (not internal_retry)
-                    and (not internal_fix)
-                    and self._last_action_signature is not None
+                    self._last_action_signature is not None
                     and self._last_observation_fingerprint is not None
                     and signature == self._last_action_signature
                     and obs_fp == self._last_observation_fingerprint
@@ -898,40 +606,7 @@ class VisualAutomationAgent:
                 plan_block = None
                 observation_summary = ""
                 rationale = ""
-                if internal_retry:
-                    attempt = self._pending_confirm_attempts
-                    pending = ", ".join(self._pending_confirm_readout_rois)
-                    action_label = self._pending_confirm_for_action or "(previous action)"
-                    say = (
-                        f"Couldn't confirm the last action via readout ROIs; re-observing ({attempt}/5). "
-                        f"Action: {action_label}. ROIs: {pending}."
-                    )
-                    observation_summary = say
-                    rationale = "Confirmation requires readable readout ROIs before continuing."
-                    plan_block = []
-                elif internal_fix:
-                    attempt = self._pending_confirm_attempts
-                    action_label = self._pending_confirm_for_action or "(previous action)"
-                    check = self._pending_confirmation_check()
-                    mismatches = check.get("mismatches", [])
-                    mm_lines: list[str] = []
-                    if isinstance(mismatches, list):
-                        for mm in mismatches[:2]:
-                            try:
-                                mm_lines.append(
-                                    f"{mm.get('roi')}: expected ~{mm.get('expected_base')} {mm.get('base_unit')}, observed {mm.get('observed')}"
-                                )
-                            except Exception:
-                                continue
-                    mm_text = "; ".join(mm_lines) if mm_lines else "(mismatch)"
-                    say = (
-                        f"Readout mismatch after the last action; retrying that action ({attempt}/5). "
-                        f"Action: {action_label}. {mm_text}."
-                    )
-                    observation_summary = say
-                    rationale = "The observed readout does not match the expected result of the previous action."
-                    plan_block = []
-                elif plan_exhausted and action == terminal_tool and not action_input:
+                if plan_exhausted and action == terminal_tool and not action_input:
                     parts: list[str] = []
                     for k, v in (self._last_readouts or {}).items():
                         if k and v:
@@ -990,91 +665,7 @@ class VisualAutomationAgent:
                     results=results,
                 )
                 self._remember(f"Tool: {action} args={action_input}")
-
-                # If we just performed an observe for a pending confirmation, immediately re-check and clear
-                # the pending gate using the tool-updated readouts. This avoids getting stuck if a subsequent
-                # full-screen observation parse is noisy.
-                if action == "observe" and self._pending_confirm_readout_rois:
-                    check = self._pending_confirmation_check()
-                    self._pending_confirm_last_check = dict(check) if isinstance(check, dict) else {}
-                    mm = check.get("mismatches", []) if isinstance(check, dict) else []
-                    if isinstance(mm, list) and mm:
-                        self._pending_confirm_force_fix = True
-                    if bool(check.get("ok", False)):
-                        self._pending_confirm_readout_rois = []
-                        self._pending_confirm_attempts = 0
-                        self._pending_confirm_for_action = ""
-                        self._pending_confirm_tool_name = ""
-                        self._pending_confirm_tool_args = {}
-                        self._pending_confirm_signature = None
-                        self._pending_confirm_expected = {}
-                        self._pending_confirm_force_fix = False
-                        self._pending_confirm_last_check = {}
-
-                # If the tool implies readout verification (via readout ROIs), require confirmation before proceeding.
-                if action not in {"observe", "wait_until", "finish", "fail", "launch_calibrator"}:
-                    readout_rois: list[str] = []
-
-                    # Prefer anchor-linked ROIs as the default “what to verify” policy.
-                    anchor_name = action_input.get("anchor", None)
-                    if isinstance(anchor_name, str) and anchor_name.strip():
-                        try:
-                            anchor = self.workspace.anchor(anchor_name.strip())
-                            linked = list(getattr(anchor, "linked_rois", []) or [])
-                            readout_rois = [r for r in linked if isinstance(r, str) and self._is_readout_roi(r)]
-                        except Exception:
-                            readout_rois = []
-
-                    # If the anchor has no linked_ROIs, fall back to whatever ROIs the model included in the tool args.
-                    if not readout_rois:
-                        roi_names = action_input.get("rois", None)
-                        if isinstance(roi_names, list):
-                            readout_rois = [
-                                str(x).strip()
-                                for x in roi_names
-                                if isinstance(x, str) and self._is_readout_roi(str(x))
-                            ]
-                        else:
-                            roi = action_input.get("roi", None)
-                            if isinstance(roi, str) and self._is_readout_roi(roi):
-                                readout_rois = [roi.strip()]
-                    readout_rois = [r for r in readout_rois if r]
-                    if readout_rois:
-                        prev_sig = self._pending_confirm_signature
-                        prev_attempts = self._pending_confirm_attempts
-
-                        expected: dict[str, dict[str, Any]] = {}
-                        typed_text = action_input.get("typed_text", None)
-                        if isinstance(typed_text, str) and typed_text.strip():
-                            # Build expected readout values based on typed_text, using each ROI's unit/dimension.
-                            for roi_name in readout_rois:
-                                observed_hint = (self._last_readouts or {}).get(roi_name, "")
-                                base_unit = self._infer_base_unit(roi_name=roi_name, value_str=str(observed_hint))
-                                if base_unit is None:
-                                    base_unit = self._infer_base_unit(roi_name=roi_name, value_str=roi_name)
-                                parsed_expected = self._parse_quantity_to_base(
-                                    roi_name=roi_name, value_str=typed_text.strip(), default_base=base_unit
-                                )
-                                if parsed_expected:
-                                    expected_base, exp_unit = parsed_expected
-                                    expected[roi_name] = {
-                                        "expected_from": typed_text.strip(),
-                                        "expected_base": float(expected_base),
-                                        "base_unit": exp_unit,
-                                    }
-
-                        self._pending_confirm_readout_rois = readout_rois
-                        self._pending_confirm_for_action = self._last_action_log or action
-                        self._pending_confirm_tool_name = action
-                        self._pending_confirm_tool_args = dict(action_input)
-                        self._pending_confirm_signature = signature
-                        self._pending_confirm_expected = expected
-                        if prev_sig == signature:
-                            self._pending_confirm_attempts = prev_attempts
-                        else:
-                            self._pending_confirm_attempts = 0
-
-                if planned_steps and consumed_planned_step:
+                if planned_steps:
                     step_ptr += 1
                 if flow == "break":
                     break
