@@ -94,7 +94,8 @@ def handle(
             "unreadable": unreadable,
         },
     )
-    if agent._consecutive_observes >= 3:
+    pending = getattr(agent, "_pending_confirm_readout_rois", []) or []
+    if agent._consecutive_observes >= 3 and not pending:
         agent.logger.narrate("[Agent] Observed repeatedly; stopping to avoid loops.")
         results.append({"action": "finish", "action_input": {}, "say": "Done observing."})
         agent._emit("finish", step=step_index, say="Done observing.")
