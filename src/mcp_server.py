@@ -8,8 +8,6 @@ from mcp.server.fastmcp import FastMCP
 from .tools.click_anchor import handle as tool_click_anchor
 from .tools.fail import handle as tool_fail
 from .tools.finish import handle as tool_finish
-from .tools.launch_calibrator import handle as tool_launch_calibrator
-from .tools.observe import handle as tool_observe
 from .tools.set_field import handle as tool_set_field
 from .tools.wait_until import handle as tool_wait_until
 
@@ -41,25 +39,6 @@ def create_mcp_server(*, agent: Any) -> FastMCP:
 
     def mcp_tool(**kwargs: Any):  # user-requested convenience decorator name
         return mcp.tool(**kwargs)
-
-    @mcp_tool(
-        name="observe",
-        description="Capture and log ROI screenshots. Use to re-check the UI state.",
-        meta={"category": "observation"},
-    )
-    def observe(rois: Optional[list[str]] = None) -> Literal["continue", "break"]:
-        ctx = _ctx()
-        action_input: dict[str, Any] = {}
-        if rois is not None:
-            action_input["rois"] = rois
-        return tool_observe(
-            agent,
-            step_index=ctx.step_index,
-            action_input=action_input,
-            say=ctx.say,
-            signature=ctx.signature,
-            results=ctx.results,
-        )
 
     @mcp_tool(
         name="wait_until",
@@ -107,13 +86,6 @@ def create_mcp_server(*, agent: Any) -> FastMCP:
         action_input: dict[str, Any] = {"anchor": anchor}
         if rois is not None:
             action_input["rois"] = rois
-        else:
-            try:
-                linked = list(agent.workspace.anchor(anchor).linked_rois)
-            except Exception:
-                linked = []
-            if linked:
-                action_input["rois"] = linked
         return tool_click_anchor(
             agent,
             step_index=ctx.step_index,
@@ -138,33 +110,10 @@ def create_mcp_server(*, agent: Any) -> FastMCP:
         action_input: dict[str, Any] = {"anchor": anchor, "typed_text": typed_text, "submit": submit}
         if rois is not None:
             action_input["rois"] = rois
-        else:
-            try:
-                linked = list(agent.workspace.anchor(anchor).linked_rois)
-            except Exception:
-                linked = []
-            if linked:
-                action_input["rois"] = linked
         return tool_set_field(
             agent,
             step_index=ctx.step_index,
             action_input=action_input,
-            say=ctx.say,
-            signature=ctx.signature,
-            results=ctx.results,
-        )
-
-    @mcp_tool(
-        name="launch_calibrator",
-        description="Launch the ROI/anchor calibrator GUI for the current workspace and stop.",
-        meta={"category": "calibration"},
-    )
-    def launch_calibrator() -> Literal["continue", "break"]:
-        ctx = _ctx()
-        return tool_launch_calibrator(
-            agent,
-            step_index=ctx.step_index,
-            action_input={},
             say=ctx.say,
             signature=ctx.signature,
             results=ctx.results,

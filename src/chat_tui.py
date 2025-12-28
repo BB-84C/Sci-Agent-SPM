@@ -6,6 +6,8 @@ import os
 import re
 import threading
 import shutil
+import subprocess
+import sys
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -227,7 +229,8 @@ class ChatApp(App[None]):
     def on_unmount(self) -> None:
         if not self._current_session_saved:
             self._delete_log_roots(self._session_log_roots)
-        self._clear_temp_session()
+        # Keep `.temp_session.json` on disk for crash recovery / post-run inspection.
+        # The temp session is cleared explicitly when the user starts a new session.
 
     def _clear_temp_session(self) -> None:
         try:
@@ -917,6 +920,10 @@ class ChatApp(App[None]):
             "PLAN": ("PLAN", t.accent),
             "OBSERVATION": ("OBSERVATION", t.dim),
             "THOUGHT": ("THOUGHT", t.agent),
+            "ACTION": ("ACTION", t.accent),
+            "OBSERVE": ("OBSERVE", t.dim),
+            "THINK": ("THINK", t.agent),
+            "NEXT": ("NEXT", t.user),
             "TOOL CALL": ("TOOL CALL", t.accent),
             "TOOL RESULT": ("TOOL RESULT", t.user),
             "DONE": ("DONE", t.fg),
@@ -1006,6 +1013,9 @@ class ChatApp(App[None]):
                         "/agent_model [name]",
                         "/tool_call_model [name]",
                         "/max_agent_steps [int]",
+                        "/memory_turn",
+                        "/set_memory_turn [-1|N]",
+                        "/calibration_tool",
                         "/action_delay [seconds]",
                         "/abort_hotkey [on|off]",
                         "/log_dir [path]",
@@ -1050,6 +1060,38 @@ class ChatApp(App[None]):
                 self._append_block("Workspace", f"Workspace set to: {self._agent.workspace.source_path}")
             except Exception as e:
                 self._append_error(str(e))
+            return True
+
+        if cmd in {"/memory_turn", "/memory-turn"}:
+            self._append_block("Memory Turn", f"Current memory_turns: {self._agent.config.memory_turns}")
+            return True
+
+        if cmd in {"/set_memory_turn", "/set-memory-turn"}:
+            if not rest:
+                self._append_error("Usage: /set_memory_turn [-1|N]")
+                return True
+            try:
+                self._agent.set_memory_turns(int(rest.strip()))
+                self._append_block("Memory Turn", f"memory_turns set to: {self._agent.config.memory_turns}")
+            except Exception as e:
+                self._append_error(str(e))
+            return True
+
+        if cmd in {"/calibration_tool", "/calibration-tool"}:
+            ws_path = str(self._agent.workspace.source_path)
+            try:
+                subprocess.Popen([sys.executable, "-m", "src.calibrate_gui", "--workspace", ws_path], close_fds=True)
+                self._append_block(
+                    "Calibration",
+                    "\n".join(
+                        [
+                            f"Launched calibrator for: {ws_path}",
+                            "Save in the calibrator, then rerun your command.",
+                        ]
+                    ),
+                )
+            except Exception as e:
+                self._append_error(f"Failed to launch calibrator: {e}")
             return True
 
         if cmd in {"/agent_model", "/agent-model", "/model"}:
@@ -1361,6 +1403,21 @@ class ChatApp(App[None]):
             plan = ev.get("plan", None)
             if isinstance(plan, list) and plan:
                 self._append_block("Plan", "\n".join(f"- {x}" for x in plan))
+            return
+        if t == "plan_text":
+            txt = str(ev.get("text", "") or "").strip()
+            if txt:
+                self._append_block("Plan", txt)
+            return
+        if t == "step_blocks":
+            action = str(ev.get("action", "") or "").strip()
+            observe = str(ev.get("observe", "") or "").strip()
+            think = str(ev.get("think", "") or "").strip()
+            nxt = str(ev.get("next", "") or "").strip()
+            self._append_block("Action", action or "(none)")
+            self._append_block("Observe", observe or "(none)")
+            self._append_block("Think", think or "(none)")
+            self._append_block("Next", nxt or "(none)")
             return
         if t == "decision":
             say = str(ev.get("say", "")).strip()
