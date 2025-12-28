@@ -296,8 +296,6 @@ class OpenAiMultimodalClient:
         self,
         *,
         system_prompt: str,
-        user_command: str,
-        plan_text: str,
         last_action_done: Mapping[str, Any],
         observation_of_last_action: Optional[Mapping[str, Any]],
         rationale: str,
@@ -311,15 +309,32 @@ class OpenAiMultimodalClient:
         """
         narrator_system = (
             f"{system_prompt}\n\n"
-            "NARRATION MODE:\n"
-            "- You render user-facing text for ACTION / OBSERVE / THINK / NEXT blocks.\n"
-            "- The runtime has already executed the ACTION tool; you MUST NOT claim you lack tool access.\n"
-            "- You MUST NOT say you cannot observe/read ROIs if OBSERVE (raw) contains results.\n"
-            "- Do NOT ask the user to re-enable interactivity or provide screenshots.\n"
-            "- Do NOT invent extra plans or tool calls.\n"
-            "- Return ONLY one JSON object.\n"
-            '- JSON keys: "action", "observe", "think", "next" (all required strings).\n'
-            "- Keep each field concise.\n"
+            "NARRATION MODE (FORMATTER ONLY):\n"
+            "- You are a formatter that converts the provided JSON fields into 4 short, human-friendly agent-style blocks.\n"
+            "- Do NOT add new facts. Do NOT infer missing steps. Use ONLY the provided JSON.\n"
+            "- Do NOT mention tool access, permissions, modes, screenshots, or limitations.\n"
+            '  Never say phrases like: "I can\'t", "I cannot", "no access", "this turn", "provide screenshots", "re-enable".\n'
+            "- Return ONLY one JSON object with exactly these keys: action, observe, think, next.\n"
+            "- Each field must be 1-2 sentences.\n\n"
+            "ACTION block rules:\n"
+            "- Describe what was just done in natural first-person past tense.\n"
+            '- If last_action_done.status == "finished": e.g., "I set bias_input to 400 mV."\n'
+            '- If status != "finished" or error present: e.g., "The step failed while running <tool>(...). Error: <error>."\n'
+            "OBSERVE block rules:\n"
+            "- Report what the ROIs show in plain language.\n"
+            "- If observation_of_last_action is null OR rois is empty: say you skipped verification because there were no linked ROIs.\n"
+            "- Else: mention key ROI values; include confidence only if present and <0.8.\n"
+            "THINK block rules:\n"
+            "- Rephrase the provided rationale lightly as an agent intent, but do not introduce new reasoning.\n"
+            "NEXT block rules:\n"
+            "- State the next step as what you will do next, and what you will verify (using linked_rois if present).\n\n"
+            "Example:\n"
+            "{\n"
+            "  \"action\": \"I entered 400 mV into the bias field.\",\n"
+            "  \"observe\": \"The bias readout shows 0.400 V.\",\n"
+            "  \"think\": \"Bias looks correct, so the next step is setting the current.\",\n"
+            "  \"next\": \"Next I\u2019ll set the current to 10 pA and then confirm it on set_current_readout.\"\n"
+            "}\n"
         )
         try:
             action_json = json.dumps(dict(last_action_done), ensure_ascii=False, default=str)
@@ -335,8 +350,6 @@ class OpenAiMultimodalClient:
             next_json = "{}"
 
         full_user = (
-            f"USER COMMAND: {user_command}\n\n"
-            f"PLAN:\n{plan_text}\n\n"
             f"ACTION (raw):\n{action_json}\n\n"
             f"OBSERVE (raw):\n{obs_json}\n\n"
             f"THINK (rationale):\n{rationale}\n\n"

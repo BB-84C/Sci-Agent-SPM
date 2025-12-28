@@ -560,8 +560,6 @@ class VisualAutomationAgent:
 
                 narration = self.llm_agent.narrate_react_step(
                     system_prompt=SYSTEM_PROMPT,
-                    user_command=user_command,
-                    plan_text=self._plan_text,
                     last_action_done=last_action_done,
                     observation_of_last_action=observation_of_last_action,
                     rationale=str(out["rationale"]),
