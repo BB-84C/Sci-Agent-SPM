@@ -1,10 +1,9 @@
 from __future__ import annotations
 
-import hashlib
 import json
-import time
 from dataclasses import dataclass, replace
-from typing import Any, Callable, Iterable, Literal, Mapping, Optional
+from datetime import datetime, timezone
+from typing import Any, Callable, Literal, Mapping, Optional
 
 import anyio
 from mcp.shared.memory import create_connected_server_and_client_session
@@ -21,36 +20,27 @@ from .workspace import Workspace, load_workspace
 SYSTEM_PROMPT = """You are an automation agent controlling a Windows desktop app via ROI screenshots and fixed click anchors.
 You MUST NOT claim to click UI elements by name; you can only use provided anchors and ROIs.
 
-You operate in ReAct style:
-- You see OBSERVATION text + ROI screenshots.
-- You call exactly ONE available tool per step.
-- After each tool call, you will receive a new observation.
+You operate in strict ReAct style:
+- Action (MCP tool) -> Observe (linked ROIs) -> Think -> Next action
+- You call exactly ONE MCP tool per step.
+- Observation is provided as ROI screenshots + ROI descriptions.
 
-Keep any narration short (1–2 sentences). Do not reveal internal reasoning.
-
-Guidelines:
-- If the user asks to recalibrate ROIs/anchors, call the calibration tool.
-- Prefer observing relevant ROIs after taking actions.
-- If an anchor declares linked_ROIs, use those ROIs for post-action verification (and for deciding what to wait on).
-- If the user asks you to report a numeric readout (e.g., bias/current/countdown), do not finish until you have either reported the value(s) or explicitly said the ROI is unreadable and asked to recalibrate/expand it.
-- Avoid repeating actions without checking results. If the UI looks correct, stop using a terminal tool.
-
-IMPORTANT:
-- Use the ROI images directly to judge whether values changed as intended.
-- Choose anchor/ROI names from the workspace lists in OBSERVATION.
-- If a requested action requires an anchor or ROI that does not exist, call the calibration tool (do not stop with an error).
+Keep any narration short (1-2 sentences). Do not reveal hidden chain-of-thought.
 """
 
 
 @dataclass(frozen=True, slots=True)
 class AgentConfig:
     agent_model: str = "gpt-5.2"
-    tool_call_model: str = "gpt-5.2"
-    max_steps: int = 10
+    tool_call_model: str = "gpt-5-nano"
+    max_steps: int = 50
     action_delay_s: float = 0.25
     log_dir: str = "logs"
     abort_hotkey: bool = True
-    memory_turns: int = 6
+    # -1: pass full structured memory; otherwise keep last N entries.
+    memory_turns: int = -1
+    # Internal observe retry count for unreadable ROIs.
+    observe_max_retries: int = 5
 
 
 class VisualAutomationAgent:
@@ -81,18 +71,17 @@ class VisualAutomationAgent:
         # Back-compat alias used by some tool implementations.
         self.llm = self.llm_agent
 
+        self._plan_text: str = "(none)"
+        self._memory: list[dict[str, Any]] = []
+
         self._last_action_log: str = "(none yet)"
-        self._memory: list[str] = []
-        self._turn: int = 0
+        # Tool back-compat fields (not used by the new orchestrator logic).
         self._consecutive_observes: int = 0
         self._last_action_signature: Optional[str] = None
         self._observed_since_last_action: bool = True
-        self._last_observation_fingerprint: Optional[str] = None
         self._tokens_in: int = 0
         self._tokens_out: int = 0
         self._tokens_total: int = 0
-        self._last_readouts: dict[str, str] = {}
-        self._last_unreadable_readouts: list[str] = []
 
         self._mcp = create_mcp_server(agent=self)
         self._openai_tools_cache: Optional[list[dict[str, Any]]] = None
@@ -164,11 +153,17 @@ class VisualAutomationAgent:
         self.logger = RunLogger(root_dir=log_dir)
 
     def set_workspace(self, workspace_path: str) -> None:
-        ws = load_workspace(workspace_path)
-        self.workspace = ws
+        self.workspace = load_workspace(workspace_path)
+
+    def set_memory_turns(self, memory_turns: int) -> None:
+        memory_turns = int(memory_turns)
+        if memory_turns < -1:
+            raise ValueError("memory_turns must be -1 (full) or >= 0.")
+        self.config = replace(self.config, memory_turns=memory_turns)
 
     def export_session(self) -> Mapping[str, Any]:
         return {
+            "plan_text": self._plan_text,
             "memory": list(self._memory),
             "last_action_log": self._last_action_log,
             "tokens": {
@@ -179,9 +174,10 @@ class VisualAutomationAgent:
         }
 
     def import_session(self, state: Mapping[str, Any]) -> None:
+        self._plan_text = str(state.get("plan_text", self._plan_text))
         mem = state.get("memory", None)
-        if isinstance(mem, list) and all(isinstance(x, str) for x in mem):
-            self._memory = list(mem)
+        if isinstance(mem, list) and all(isinstance(x, dict) for x in mem):
+            self._memory = [dict(x) for x in mem]
         self._last_action_log = str(state.get("last_action_log", self._last_action_log))
         toks = state.get("tokens", None)
         if isinstance(toks, dict):
@@ -227,11 +223,17 @@ class VisualAutomationAgent:
                 mcp_tools = await mcp_session.list_tools()
             openai_tools: list[dict[str, Any]] = []
             for t in mcp_tools.tools:
-                self._tool_meta_by_name[t.name] = dict(t.meta or {})
+                name = str(t.name or "").strip()
+                self._tool_meta_by_name[name] = dict(t.meta or {})
+                # Internal-only / UI-only tools:
+                if name in {"observe", "launch_calibrator"}:
+                    continue
+                if not name:
+                    continue
                 openai_tools.append(
                     {
                         "type": "function",
-                        "name": t.name,
+                        "name": name,
                         "description": t.description or "",
                         "parameters": t.inputSchema,
                         "strict": False,
@@ -242,51 +244,12 @@ class VisualAutomationAgent:
         self._openai_tools_cache = anyio.run(_list)
         return list(self._openai_tools_cache)
 
-    def _pick_terminal_tool_name(self) -> str:
-        if self._openai_tools_cache is None:
-            self._openai_tools()
-        preferred: Optional[str] = None
-        for name, meta in self._tool_meta_by_name.items():
-            try:
-                md = dict(meta)
-                if not bool(md.get("terminal", False)):
-                    continue
-                if not bool(md.get("error", False)):
-                    return str(name)
-                if preferred is None:
-                    preferred = str(name)
-            except Exception:
-                continue
-        if preferred is not None:
-            return preferred
-        if self._tool_meta_by_name:
-            return next(iter(self._tool_meta_by_name.keys()))
-        raise RuntimeError("No tools available.")
-
     def _call_signature(self, *, tool_name: str, tool_args: Mapping[str, Any]) -> str:
         try:
             normalized = json.dumps(tool_args, sort_keys=True, ensure_ascii=False, default=str)
         except Exception:
-            try:
-                normalized = str(sorted((str(k), str(v)) for k, v in tool_args.items()))
-            except Exception:
-                normalized = "<?>"
+            normalized = "<?>"
         return f"{tool_name}:{normalized}"
-
-    def _observation_fingerprint(self, images: Iterable[tuple[str, str, Any]]) -> str:
-        """
-        Fingerprint the current UI state using a downscaled byte signature of ROI images.
-        This avoids treating blank lines in observation text as state changes.
-        """
-        h = hashlib.sha1()
-        for name, _desc, img in images:
-            h.update(str(name).encode("utf-8", errors="ignore"))
-            try:
-                im = img.convert("RGB").resize((24, 24))
-                h.update(im.tobytes())
-            except Exception:
-                h.update(repr(img).encode("utf-8", errors="ignore"))
-        return h.hexdigest()
 
     def _call_mcp_tool(
         self,
@@ -294,11 +257,10 @@ class VisualAutomationAgent:
         tool_name: str,
         tool_args: Mapping[str, Any],
         step_index: int,
-        say: str,
         signature: Optional[str],
         results: list[dict[str, Any]],
     ) -> Literal["continue", "break"]:
-        self._mcp_tool_ctx = McpToolContext(step_index=step_index, say=say, signature=signature, results=results)
+        self._mcp_tool_ctx = McpToolContext(step_index=step_index, say="", signature=signature, results=results)
 
         async def _call() -> str:
             async with create_connected_server_and_client_session(self._mcp) as mcp_session:
@@ -315,125 +277,175 @@ class VisualAutomationAgent:
 
         return "break" if flow == "break" else "continue"
 
-    def _workspace_text(self) -> str:
-        rois = "\n".join(f"- {r.name}: {r.description}" for r in self.workspace.rois) or "(none)"
-        anchor_lines: list[str] = []
+    def _workspace_info(self) -> dict[str, Any]:
+        rois: list[dict[str, Any]] = []
+        for r in self.workspace.rois:
+            rois.append({"name": r.name, "description": r.description or ""})
+        anchors: list[dict[str, Any]] = []
         for a in self.workspace.anchors:
-            linked = ", ".join(a.linked_rois) if a.linked_rois else ""
-            suffix = f" (linked_ROIs: {linked})" if linked else ""
-            anchor_lines.append(f"- {a.name}: {a.description}{suffix}")
-        anchors = "\n".join(anchor_lines) or "(none)"
-        return f"ROIs:\n{rois}\n\nAnchors:\n{anchors}"
+            anchors.append(
+                {
+                    "name": a.name,
+                    "description": a.description or "",
+                    "linked_rois": list(a.linked_rois or []),
+                }
+            )
+        return {"workspace_path": str(self.workspace.source_path), "rois": rois, "anchors": anchors}
 
-    def _memory_text(self) -> str:
-        if not self._memory:
-            return "(empty)"
-        keep = self._memory[-max(1, self.config.memory_turns) :]
-        return "\n".join(keep)
+    def _memory_entries_for_llm(self) -> list[dict[str, Any]]:
+        turns = int(self.config.memory_turns)
+        if turns == -1:
+            return list(self._memory)
+        if turns <= 0:
+            return []
+        return list(self._memory[-turns:])
 
-    def _remember(self, line: str) -> None:
-        line = line.strip()
-        if not line:
-            return
-        self._memory.append(line)
-        if len(self._memory) > max(1, self.config.memory_turns) * 3:
-            self._memory = self._memory[-max(1, self.config.memory_turns) * 3 :]
+    def _now_iso(self) -> str:
+        return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
-    def _observe_images(self, roi_names: Iterable[str]) -> list[tuple[str, str, Any]]:
-        out: list[tuple[str, str, Any]] = []
-        for name in roi_names:
-            roi = self.workspace.roi(name)
-            out.append((name, roi.description, self.capturer.capture_roi(roi)))
+    def _resolve_linked_rois(self, next_action: Mapping[str, Any]) -> list[str]:
+        args = next_action.get("args", {})
+        if isinstance(args, dict):
+            anchor = args.get("anchor", None)
+            if isinstance(anchor, str) and anchor.strip():
+                try:
+                    linked = list(self.workspace.anchor(anchor.strip()).linked_rois or [])
+                    return [x for x in linked if isinstance(x, str) and x.strip()]
+                except Exception:
+                    return []
+
+        linked_rois = next_action.get("linked_rois", [])
+        if not isinstance(linked_rois, list):
+            return []
+        out: list[str] = []
+        for r in linked_rois:
+            if not isinstance(r, str) or not r.strip():
+                continue
+            rr = r.strip()
+            try:
+                self.workspace.roi(rr)
+            except Exception:
+                continue
+            out.append(rr)
         return out
 
-    def _is_readout_roi(self, name: str) -> bool:
-        try:
-            roi = self.workspace.roi(name)
-        except Exception:
-            return False
-        n = (roi.name or "").lower()
-        d = (roi.description or "").lower()
-        tags = [str(t).lower() for t in (roi.tags or ())]
-        return ("readout" in n) or ("readout" in d) or ("readout" in tags)
+    def _observe(self, *, rois: list[str]) -> Mapping[str, Any]:
+        if not rois:
+            return {"rois": [], "results": {}, "unreadable": []}
 
-    def _refresh_parsed_readouts_from_images(self, images: list[tuple[str, str, Any]]) -> None:
-        readout_items = [(n, d, img) for (n, d, img) in images if self._is_readout_roi(n)]
-        if not readout_items:
-            return
-        try:
-            extracted = self.llm_tool.extract_readouts(roi_items=readout_items)
+        resolved = []
+        for r in rois:
+            rr = str(r).strip()
+            if not rr:
+                continue
+            resolved.append(self.workspace.roi(rr))
+        roi_names = [r.name for r in resolved]
+        roi_descs = [r.description or "" for r in resolved]
+
+        last: Mapping[str, Any] = {"rois": roi_names, "results": {}, "unreadable": list(roi_names)}
+        attempts = max(1, int(self.config.observe_max_retries))
+        for attempt in range(1, attempts + 1):
+            images = [self.capturer.capture_roi(roi) for roi in resolved]
+            roi_items = list(zip(roi_names, roi_descs, images))
+
+            step = self.logger.start_step(f"observe_{attempt}_{roi_names[0] if roi_names else 'none'}")
+            for name, _desc, img in roi_items:
+                step.save_image(f"roi_{name}.png", img)
+
+            extracted = self.llm_tool.observe_rois(roi_items=roi_items)
             self._accumulate_last_usage(self.llm_tool)
-        except Exception:
-            return
 
-        vals = extracted.get("values", {})
-        unread = extracted.get("unreadable", [])
+            results = extracted.get("results", {})
+            unreadable = extracted.get("unreadable", [])
+            if not isinstance(results, dict):
+                results = {}
+            if not isinstance(unreadable, list):
+                unreadable = []
 
-        merged = dict(getattr(self, "_last_readouts", {}) or {})
-        if isinstance(vals, dict):
-            for k, v in vals.items():
-                ks = str(k).strip()
-                if not ks:
-                    continue
-                if v is None:
-                    continue
-                merged[ks] = str(v).strip()
+            unreadable_s = [str(x).strip() for x in unreadable if str(x).strip()]
+            unreadable_s = [x for x in unreadable_s if x in roi_names]
 
-        unread_list: list[str] = []
-        if isinstance(unread, list):
-            unread_list = [str(x).strip() for x in unread if str(x).strip()]
-        # Avoid stale values: if a readout is flagged unreadable, drop any prior value.
-        for k in unread_list:
-            merged.pop(k, None)
+            norm_results: dict[str, Any] = {}
+            for n in roi_names:
+                item = results.get(n, None)
+                if isinstance(item, dict):
+                    val = item.get("value", None)
+                    notes = item.get("notes", None)
+                    conf = item.get("confidence", None)
+                    norm_results[n] = {
+                        "value": None if val is None else str(val),
+                        "confidence": float(conf) if isinstance(conf, (int, float)) else None,
+                        "notes": "" if notes is None else str(notes),
+                    }
+                else:
+                    norm_results[n] = {"value": None, "confidence": None, "notes": ""}
 
-        self._last_readouts = merged
-        self._last_unreadable_readouts = unread_list
+            last = {"rois": roi_names, "results": norm_results, "unreadable": unreadable_s}
+            step.write_meta({"tool": "observe_internal", "attempt": attempt, "rois": roi_names, "llm": dict(extracted)})
 
-    def _default_observation(self) -> tuple[str, list[tuple[str, str, Any]]]:
-        # If the workspace has tool hints, prefer those ROIs; otherwise capture all ROIs.
-        rois = [r.name for r in self.workspace.rois]
-        readout_lines: list[str] = []
-        for k, v in (self._last_readouts or {}).items():
-            if k and v:
-                readout_lines.append(f"- {k}: {v}")
-        for k in (self._last_unreadable_readouts or []):
-            if k:
-                readout_lines.append(f"- {k}: (unreadable; consider recalibrating/expanding this ROI)")
-        readouts_text = ("\nLast parsed readouts:\n" + "\n".join(readout_lines) + "\n") if readout_lines else ""
-        images = self._observe_images(rois)
-        # Keep parsed readouts in sync with the current ROI screenshots so narration doesn't repeat stale values.
-        self._refresh_parsed_readouts_from_images(images)
+            if not unreadable_s:
+                return last
 
-        readout_lines = []
-        for k, v in (self._last_readouts or {}).items():
-            if k and v:
-                readout_lines.append(f"- {k}: {v}")
-        for k in (self._last_unreadable_readouts or []):
-            if k:
-                readout_lines.append(f"- {k}: (unreadable; consider recalibrating/expanding this ROI)")
-        readouts_text = ("\nLast parsed readouts:\n" + "\n".join(readout_lines) + "\n") if readout_lines else ""
+        bad = list(last.get("unreadable", []) or [])
+        if bad:
+            raise RuntimeError(
+                f"ROI(s) unreadable for {attempts} consecutive attempts: {', '.join(bad)}. "
+                "ROI likely miscalibrated; run /calibration_tool and retry."
+            )
+        return last
 
-        obs_text = f"Last action log: {self._last_action_log}\nAvailable ROIs: {', '.join(rois)}\n{readouts_text}"
-        obs_text = f"{obs_text}\n\n{self._workspace_text()}"
-        return obs_text, images
+    def _update_memory(
+        self,
+        *,
+        user_command: str,
+        last_action_done: Optional[Mapping[str, Any]],
+        observation_of_last_action: Optional[Mapping[str, Any]],
+        tools: list[Mapping[str, Any]],
+        workspace_info: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        out = self.llm_agent.update_memory_step(
+            system_prompt=SYSTEM_PROMPT,
+            user_command=user_command,
+            plan_text=self._plan_text,
+            memory_entries=self._memory_entries_for_llm(),
+            last_action_done=last_action_done,
+            observation_of_last_action=observation_of_last_action,
+            workspace_info=dict(workspace_info),
+            tools=list(tools),
+        )
+        self._accumulate_last_usage(self.llm_agent)
 
-    def _log_observation(
-        self, *, step_name: str, images: list[tuple[str, str, Any]], meta: Mapping[str, Any]
-    ) -> None:
-        step = self.logger.start_step(step_name)
-        for roi_name, _desc, img in images:
-            step.save_image(f"after_{roi_name}.png", img)
-        step.write_meta(dict(meta))
+        rationale = str(out.get("rationale", "")).strip()
+        next_action = out.get("next_action", None)
+        if not rationale:
+            raise RuntimeError("update_memory_step returned empty rationale.")
+        if not isinstance(next_action, dict):
+            raise RuntimeError("update_memory_step returned invalid next_action.")
+
+        tool_name = str(next_action.get("tool", "")).strip()
+        args = next_action.get("args", {})
+        linked_rois = next_action.get("linked_rois", None)
+        if not tool_name:
+            raise RuntimeError("update_memory_step returned empty next_action.tool.")
+        if not isinstance(args, dict):
+            args = {}
+        if not isinstance(linked_rois, list) or not all(isinstance(x, str) for x in linked_rois):
+            raise RuntimeError("update_memory_step next_action.linked_rois must be list[str].")
+
+        resolved_linked = self._resolve_linked_rois({"tool": tool_name, "args": args, "linked_rois": linked_rois})
+        return {"rationale": rationale, "next_action": {"tool": tool_name, "args": dict(args), "linked_rois": resolved_linked}}
 
     def run(self, *, user_command: str) -> list[Mapping[str, Any]]:
-        self._turn += 1
-        self._remember(f"User: {user_command}")
-        self._emit("user", text=user_command)
+        user_command = str(user_command or "").strip()
+        if not user_command:
+            return []
+
         # Reload workspace on each run so chat sessions track user edits (add/delete ROIs/anchors).
         try:
             self.workspace = load_workspace(self.workspace.source_path)
         except Exception:
             pass
+
         self.logger.narrate(f"Workspace: {self.workspace.source_path}")
         self.logger.narrate(
             f"Agent mode: True (agent_model={self.config.agent_model}, tool_call_model={self.config.tool_call_model})"
@@ -444,8 +456,8 @@ class VisualAutomationAgent:
 
         results: list[dict[str, Any]] = []
         openai_tools = self._openai_tools()
-        known_tools = {t.get("name") for t in openai_tools}
-        terminal_tool = self._pick_terminal_tool_name()
+        known_tools = {str(t.get("name", "")).strip() for t in openai_tools if str(t.get("name", "")).strip()}
+        workspace_info = self._workspace_info()
 
         def tool_schemas_text() -> str:
             parts: list[str] = []
@@ -454,266 +466,175 @@ class VisualAutomationAgent:
                 desc = str(t.get("description", "")).strip()
                 params = t.get("parameters", {})
                 try:
-                    import json as _json
-
-                    schema = _json.dumps(params, ensure_ascii=False)
+                    schema = json.dumps(params, ensure_ascii=False)
                 except Exception:
                     schema = "{}"
-                if not name:
-                    continue
-                line = f"- {name}: {desc}\n  inputSchema: {schema}"
-                parts.append(line)
+                if name:
+                    parts.append(f"- {name}: {desc}\n  inputSchema: {schema}")
             return "\n".join(parts) if parts else "(none)"
 
-        plan: list[str] = []
-        planned_steps: list[dict[str, Any]] = []
         try:
             plan_out = self.llm_agent.plan_step(
                 system_prompt=SYSTEM_PROMPT,
                 user_prompt=user_command,
-                memory_text=self._memory_text(),
-                workspace_text=self._workspace_text(),
+                memory_entries=self._memory_entries_for_llm(),
+                workspace_info=workspace_info,
                 tools_text=tool_schemas_text(),
             )
             self._accumulate_last_usage(self.llm_agent)
-            raw_plan = plan_out.get("plan", None)
-            if isinstance(raw_plan, list) and all(isinstance(x, str) for x in raw_plan):
-                plan = [x.strip() for x in raw_plan if x.strip()]
-
-            raw_steps = plan_out.get("steps", None)
-            if isinstance(raw_steps, list):
-                for step in raw_steps:
-                    if not isinstance(step, dict):
-                        continue
-                    tool = step.get("tool", None)
-                    args = step.get("args", None)
-                    if not isinstance(tool, str) or not tool.strip():
-                        continue
-                    if not isinstance(args, dict):
-                        continue
-                    planned_steps.append({"tool": tool.strip(), "args": dict(args), "purpose": str(step.get("purpose", "")).strip()})
+            self._plan_text = str(plan_out.get("plan_text", "")).strip() or "(none)"
         except Exception:
-            plan = []
-            planned_steps = []
+            self._plan_text = "(none)"
 
-        if plan:
-            self._remember("Plan:\n" + "\n".join(f"- {x}" for x in plan))
-            self._emit("plan", plan=plan)
+        self._emit("plan_text", text=self._plan_text)
+
         try:
-            step_ptr = 0
-            for i in range(1, self.config.max_steps + 1):
-                obs_text, obs_images = self._default_observation()
-                obs_fp = self._observation_fingerprint(obs_images)
-                self._emit(
-                    "observation",
-                    step=i,
-                    text=obs_text,
-                    rois=[{"name": n, "description": d} for (n, d, _img) in obs_images],
-                )
+            seed = self._update_memory(
+                user_command=user_command,
+                last_action_done=None,
+                observation_of_last_action=None,
+                tools=openai_tools,
+                workspace_info=workspace_info,
+            )
+            self._memory.append(
+                {
+                    "t": self._now_iso(),
+                    "plan_text": self._plan_text,
+                    "last_action_done": None,
+                    "observation_of_last_action": None,
+                    "rationale": str(seed["rationale"]),
+                    "next_action": dict(seed["next_action"]),
+                }
+            )
 
-                if planned_steps:
-                    if step_ptr >= len(planned_steps):
-                        action = terminal_tool
-                        action_input: dict[str, Any] = {}
-                    else:
-                        cur = planned_steps[step_ptr]
-                        action = str(cur.get("tool", "")).strip()
-                        action_input = dict(cur.get("args", {}) if isinstance(cur.get("args", {}), dict) else {})
-                else:
-                    model_out = self.llm_tool.react_step(
-                        system_prompt=SYSTEM_PROMPT,
-                        user_prompt=f"USER COMMAND: {user_command}",
-                        memory_text=self._memory_text(),
-                        plan_text="\n".join(f"- {x}" for x in plan) if plan else "(none)",
-                        observation_text=obs_text,
-                        observation_images=obs_images,
-                        tools=openai_tools,
-                    )
-                    self._accumulate_last_usage(self.llm_tool)
+            for step_index in range(1, int(self.config.max_steps) + 1):
+                current = self._memory[-1]
+                next_action = current.get("next_action", {})
+                if not isinstance(next_action, dict):
+                    raise RuntimeError("Missing next_action in memory.")
 
-                    tool_calls = model_out.get("tool_calls", [])
-                    if not isinstance(tool_calls, list) or not tool_calls:
-                        tool_calls = [{"name": terminal_tool, "arguments": {}}]
-                    tool_call = (
-                        tool_calls[0]
-                        if isinstance(tool_calls[0], dict)
-                        else {"name": terminal_tool, "arguments": {}}
-                    )
+                tool_name = str(next_action.get("tool", "")).strip()
+                tool_args = next_action.get("args", {})
+                if not isinstance(tool_args, dict):
+                    tool_args = {}
+                if tool_name not in known_tools:
+                    raise RuntimeError(f"Unknown tool requested: {tool_name!r}")
 
-                    action = str(tool_call.get("name", "")).strip()
-                    action_input = tool_call.get("arguments", {}) if isinstance(tool_call.get("arguments", {}), dict) else {}
-
-                if action not in known_tools:
-                    raise ValueError(f"Unknown tool requested by model: {action!r}")
-
-                signature = self._call_signature(tool_name=action, tool_args=action_input)
-                plan_exhausted = bool(planned_steps) and step_ptr >= len(planned_steps)
-
-                # Generic loop-avoidance: if the model repeats the exact same tool call while the UI
-                # (as seen via ROIs) hasn't changed, re-ask once for a different call; otherwise stop.
-                if (
-                    self._last_action_signature is not None
-                    and self._last_observation_fingerprint is not None
-                    and signature == self._last_action_signature
-                    and obs_fp == self._last_observation_fingerprint
-                ):
-                    if planned_steps:
-                        say = "UI appears unchanged and the same action is repeating; stopping to avoid loops."
-                        results.append({"action": terminal_tool, "action_input": {}, "say": say})
-                        self._emit("finish", step=i, say=say)
-                        break
-
-                    retry_out = self.llm_tool.react_step(
-                        system_prompt=SYSTEM_PROMPT,
-                        user_prompt=(
-                            f"USER COMMAND: {user_command}\n\n"
-                            "Constraint: Do NOT repeat the immediately previous tool call (same tool and same arguments)."
-                        ),
-                        memory_text=self._memory_text(),
-                        plan_text="\n".join(f"- {x}" for x in plan) if plan else "(none)",
-                        observation_text=obs_text,
-                        observation_images=obs_images,
-                        tools=openai_tools,
-                    )
-                    self._accumulate_last_usage(self.llm_tool)
-                    retry_calls = retry_out.get("tool_calls", [])
-                    if isinstance(retry_calls, list) and retry_calls and isinstance(retry_calls[0], dict):
-                        retry_action = str(retry_calls[0].get("name", "")).strip()
-                        retry_args = retry_calls[0].get("arguments", {})
-                        if isinstance(retry_args, dict) and retry_action in known_tools:
-                            retry_sig = self._call_signature(tool_name=retry_action, tool_args=retry_args)
-                            if retry_sig != signature:
-                                action = retry_action
-                                action_input = dict(retry_args)
-                                signature = retry_sig
-                            else:
-                                say = "UI appears unchanged and the model is repeating the same action; stopping to avoid loops."
-                                results.append({"action": terminal_tool, "action_input": {}, "say": say})
-                                self._emit("finish", step=i, say=say)
-                                break
-                    else:
-                        say = "UI appears unchanged and the model did not provide a different action; stopping to avoid loops."
-                        results.append({"action": terminal_tool, "action_input": {}, "say": say})
-                        self._emit("finish", step=i, say=say)
-                        break
-
-                # Record state for the next loop detection check.
-                self._last_action_signature = signature
-                self._last_observation_fingerprint = obs_fp
-
-                narration: Mapping[str, Any] = {}
-                say = ""
-                plan_block = None
-                observation_summary = ""
-                rationale = ""
-                if plan_exhausted and action == terminal_tool and not action_input:
-                    parts: list[str] = []
-                    for k, v in (self._last_readouts or {}).items():
-                        if k and v:
-                            parts.append(f"{k}={v}")
-                        if len(parts) >= 4:
-                            break
-                    if self._last_unreadable_readouts:
-                        parts.append(f"unreadable={', '.join(self._last_unreadable_readouts[:3])}")
-                    readouts_inline = "; ".join(parts) if parts else ""
-                    say = "All planned steps are complete. Finishing now."
-                    if readouts_inline:
-                        say = f"{say} Final readouts: {readouts_inline}."
-                    observation_summary = say
-                    rationale = "Planned tool steps are complete, so the run can stop."
-                    plan_block = []
-                else:
-                    try:
-                        narration = self.llm_agent.narrate_tool_call(
-                            system_prompt=SYSTEM_PROMPT,
-                            user_command=user_command,
-                            plan_text="\n".join(f"- {x}" for x in plan) if plan else "(none)",
-                            memory_text=self._memory_text(),
-                            observation_text=obs_text,
-                            tool_name=action,
-                            tool_args=action_input,
-                        )
-                        self._accumulate_last_usage(self.llm_agent)
-                    except Exception:
-                        narration = {}
-
-                    say = str(narration.get("say", "")).strip() or action
-                    if isinstance(narration.get("plan", None), list) and all(isinstance(x, str) for x in narration["plan"]):
-                        plan_block = [x.strip() for x in narration["plan"] if isinstance(x, str) and x.strip()]
-                    observation_summary = str(narration.get("observation", "")).strip()
-                    rationale = str(narration.get("rationale", "")).strip()
-
-                self.logger.narrate(f"[Agent] Step {i}/{self.config.max_steps}: {say}")
-                self._remember(f"Agent: {say}")
-                self._emit(
-                    "decision",
-                    step=i,
-                    say=say,
-                    action=action,
-                    action_input=action_input,
-                    plan=plan_block,
-                    observation=observation_summary,
-                    rationale=rationale,
-                )
-
+                signature = self._call_signature(tool_name=tool_name, tool_args=tool_args)
                 flow = self._call_mcp_tool(
-                    tool_name=action,
-                    tool_args=action_input,
-                    step_index=i,
-                    say=say,
+                    tool_name=tool_name,
+                    tool_args=tool_args,
+                    step_index=step_index,
                     signature=signature,
                     results=results,
                 )
-                self._remember(f"Tool: {action} args={action_input}")
-                if planned_steps:
-                    step_ptr += 1
+
+                last_action_done: dict[str, Any] = {
+                    "tool": tool_name,
+                    "args": dict(tool_args),
+                    "status": "finished",
+                    "error": None,
+                }
+
+                observed_rois = self._resolve_linked_rois(next_action)
+                observation_of_last_action: Optional[Mapping[str, Any]] = None
+                if observed_rois:
+                    observation_of_last_action = self._observe(rois=observed_rois)
+
+                out = self._update_memory(
+                    user_command=user_command,
+                    last_action_done=last_action_done,
+                    observation_of_last_action=observation_of_last_action,
+                    tools=openai_tools,
+                    workspace_info=workspace_info,
+                )
+
+                entry = {
+                    "t": self._now_iso(),
+                    "last_action_done": last_action_done,
+                    "observation_of_last_action": observation_of_last_action,
+                    "rationale": str(out["rationale"]),
+                    "next_action": dict(out["next_action"]),
+                }
+                self._memory.append(entry)
+
+                narration = self.llm_agent.narrate_react_step(
+                    system_prompt=SYSTEM_PROMPT,
+                    user_command=user_command,
+                    plan_text=self._plan_text,
+                    last_action_done=last_action_done,
+                    observation_of_last_action=observation_of_last_action,
+                    rationale=str(out["rationale"]),
+                    next_action=dict(out["next_action"]),
+                )
+                self._accumulate_last_usage(self.llm_agent)
+
+                def _bad_narr(s: Any) -> bool:
+                    text = str(s or "").strip().lower()
+                    if not text:
+                        return True
+                    return any(
+                        p in text
+                        for p in [
+                            "i can't",
+                            "i cannot",
+                            "no tool access",
+                            "no access",
+                            "not available this turn",
+                            "unable to",
+                            "can't read",
+                            "cannot read",
+                            "can't observe",
+                            "cannot observe",
+                        ]
+                    )
+
+                def _fallback_observe_text(obs: Optional[Mapping[str, Any]]) -> str:
+                    if not isinstance(obs, dict):
+                        return "No linked ROIs observed."
+                    rois = obs.get("rois", [])
+                    results = obs.get("results", {})
+                    if not isinstance(rois, list) or not rois:
+                        return "No linked ROIs observed."
+                    parts = []
+                    if isinstance(results, dict):
+                        for r in rois:
+                            if not isinstance(r, str) or not r.strip():
+                                continue
+                            item = results.get(r, {})
+                            if isinstance(item, dict):
+                                val = item.get("value", None)
+                                if val is not None and str(val).strip():
+                                    parts.append(f"{r}={str(val).strip()}")
+                    return "Observed: " + (", ".join(parts) if parts else ", ".join(str(x) for x in rois))
+
+                if not isinstance(narration, dict) or any(
+                    _bad_narr(narration.get(k, "")) for k in ["action", "observe", "think", "next"]
+                ):
+                    narration = {
+                        "action": f"Executed {tool_name} with args={json.dumps(tool_args, ensure_ascii=False)} (status=finished).",
+                        "observe": _fallback_observe_text(observation_of_last_action),
+                        "think": str(out["rationale"]),
+                        "next": f"Next: {str(out['next_action'].get('tool','')).strip()} args={json.dumps(out['next_action'].get('args',{}), ensure_ascii=False)} linked_rois={out['next_action'].get('linked_rois', [])}",
+                    }
+
+                self._emit(
+                    "step_blocks",
+                    step=step_index,
+                    action=str(narration.get("action", "")).strip(),
+                    observe=str(narration.get("observe", "")).strip(),
+                    think=str(narration.get("think", "")).strip(),
+                    next=str(narration.get("next", "")).strip(),
+                    raw=entry,
+                )
+
+                self._last_action_log = f"{tool_name}({tool_args})"
+
                 if flow == "break":
                     break
-            else:
-                # Step limit reached without a terminal tool: assess progress and finish gracefully.
-                obs_text, _obs_images = self._default_observation()
-                executed = results[-8:]
-                executed_lines: list[str] = []
-                for r in executed:
-                    try:
-                        executed_lines.append(
-                            f"- {str(r.get('action', ''))} args={str(r.get('action_input', {}))} say={str(r.get('say', '')).strip()}"
-                        )
-                    except Exception:
-                        continue
-                executed_text = "\n".join(executed_lines) if executed_lines else "(none)"
-                assessment_say = (
-                    f"Reached the maximum of {self.config.max_steps} steps before finishing. "
-                    "I will stop here and report the current progress. "
-                    "If you want me to continue, increase /max_agent_steps or ask me to proceed."
-                )
-                try:
-                    plan_text = "\n".join(f"- {x}" for x in plan) if plan else "(none)"
-                    assess = self.llm_agent.assess_step_limit(
-                        system_prompt=SYSTEM_PROMPT,
-                        user_command=user_command,
-                        plan_text=plan_text,
-                        memory_text=self._memory_text(),
-                        observation_text=obs_text,
-                        executed_steps_text=executed_text,
-                        max_steps=int(self.config.max_steps),
-                    )
-                    self._accumulate_last_usage(self.llm_agent)
-                    assessment_say = str(assess.get("say", "")).strip() or assessment_say
-                except Exception:
-                    pass
-                assessment_say = f"Stopped: reached max agent steps ({self.config.max_steps}). {assessment_say}".strip()
+                if str(out["next_action"].get("tool", "")).strip() == "finish":
+                    break
 
-                finish_name = "finish" if "finish" in known_tools else terminal_tool
-                finish_sig = self._call_signature(tool_name=finish_name, tool_args={})
-                self._call_mcp_tool(
-                    tool_name=finish_name,
-                    tool_args={},
-                    step_index=int(self.config.max_steps),
-                    say=assessment_say,
-                    signature=finish_sig,
-                    results=results,
-                )
         finally:
             if self._abort is not None:
                 self._abort.stop()
@@ -730,7 +651,6 @@ class VisualAutomationAgent:
             except KeyboardInterrupt:
                 self.logger.narrate("Aborted.")
             except Exception as e:
-                # Stay in the chat session even if one command fails.
                 self.logger.narrate(f"[Agent/Error] {e}")
 
         if first_message and first_message.strip():
