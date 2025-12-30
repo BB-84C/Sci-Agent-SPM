@@ -251,6 +251,7 @@ class ChatApp(App[None]):
             log_dir=str(getattr(cfg, "log_dir", "") or "").strip() or None,
             memory_turns=int(getattr(cfg, "memory_turns", -1)),
             mode=str(getattr(cfg, "run_mode", "") or "").strip() or None,
+            memory_compress_threshold_tokens=int(getattr(cfg, "memory_compress_threshold_tokens", 300_000)),
         )
 
     def _save_persisted_settings(self) -> None:
@@ -307,6 +308,11 @@ class ChatApp(App[None]):
         try:
             if st.mode:
                 self._agent.set_run_mode(st.mode)
+        except Exception:
+            pass
+        try:
+            if st.memory_compress_threshold_tokens is not None:
+                self._agent.set_memory_compress_threshold_tokens(int(st.memory_compress_threshold_tokens))
         except Exception:
             pass
 
@@ -609,11 +615,11 @@ class ChatApp(App[None]):
             pass
         self._set_status("Ready")
         self._append_system(f"Workspace: {self._agent.workspace.source_path}")
-        self._append_system("Enter: send • Shift+Enter: newline • /help for commands")
+        self._append_system("Use /help for help")
         if self._agent.config.abort_hotkey:
-            self._append_system("Safety: Ctrl+C abort hotkey • Mouse to top-left FAILSAFE")
+            self._append_system("Safety: Ctrl+C abort hotkey")
         else:
-            self._append_system("Safety: Mouse to top-left FAILSAFE (abort hotkey disabled)")
+            self._append_system("Safety: Abort hotkey disabled, use /help to learn how to enable abort")
         self._sync_tokens_from_agent()
         self._track_log_root(self._current_log_root())
         self._request_cache_usage_update()
@@ -1182,25 +1188,31 @@ class ChatApp(App[None]):
             self._append_block(
                 "Help",
                 "\n".join(
-                    [
-                        "/help or /menu",
-                        "/workspace [path]",
-                        "/agent_model [name]",
-                        "/tool_call_model [name]",
-                        "/max_agent_steps [int]",
-                        "/mode",
-                        "/mode agent|chat|auto",
-                        "/memory_turn",
-                        "/set_memory_turn [-1|N]",
-                        "/calibration_tool",
-                        "/action_delay [seconds]",
-                        "/abort_hotkey [on|off]",
-                        "/log_dir [path]",
-                        "/chat new",
-                        "/chat save [name]",
-                        "/chat list",
-                        "/chat resume <name>",
-                        "/clear_cache",
+                    
+                    [   
+                        "",
+                        "Commands:",
+                        "- /help or /menu",
+                        "- /workspace [path]",
+                        "- /agent_model [name]",
+                        "- /tool_call_model [name]",
+                        "- /max_agent_steps [int]",
+                        "- /mode",
+                        "- /mode agent|chat|auto",
+                        "- /memory_turn",
+                        "- /set_memory_turn [-1|N]",
+                        "- /memory_compress_threshold",
+                        "- /memory_compress_threshold [int tokens]",
+                        "- /compress_memory",
+                        "- /calibration_tool",
+                        "- /action_delay [seconds]",
+                        "- /abort_hotkey [on|off]",
+                        "- /log_dir [path]",
+                        "- /chat new",
+                        "- /chat save [name]",
+                        "- /chat list",
+                        "- /chat resume <name>",
+                        "- /clear_cache",
                         "",
                         "Input:",
                         "- Enter: newline",
@@ -1266,6 +1278,52 @@ class ChatApp(App[None]):
                 self._append_block("Memory Turn", f"memory_turns set to: {self._agent.config.memory_turns}")
             except Exception as e:
                 self._append_error(str(e))
+            return True
+
+        if cmd in {"/memory_compress_threshold", "/memory-compress-threshold"}:
+            if not rest:
+                self._append_block(
+                    "Memory Compress Threshold",
+                    f"Current threshold tokens: {getattr(self._agent.config, 'memory_compress_threshold_tokens', 0)}",
+                )
+                return True
+            try:
+                self._agent.set_memory_compress_threshold_tokens(int(rest.strip()))
+                self._save_persisted_settings()
+                self._append_block(
+                    "Memory Compress Threshold",
+                    f"Threshold set to: {getattr(self._agent.config, 'memory_compress_threshold_tokens', 0)} tokens",
+                )
+            except Exception as e:
+                self._append_error(str(e))
+            return True
+
+        if cmd in {"/compress_memory", "/compress-memory"}:
+            if self.busy:
+                self._append_error("Busy; wait for the agent to finish the current turn.")
+                return True
+
+            self.busy = True
+            self._set_status("Compressing…")
+
+            def sink(ev: Mapping[str, Any]) -> None:
+                self.post_message(AgentEvent(ev))
+
+            prev = getattr(self._agent, "_event_sink", None)
+            setattr(self._agent, "_event_sink", sink)
+
+            def run_bg() -> None:
+                try:
+                    self._agent.compress_memory(reason="manual_command(/compress_memory)")
+                except KeyboardInterrupt:
+                    self.post_message(AgentEvent({"type": "aborted"}))
+                except Exception as e:
+                    self.post_message(AgentEvent({"type": "error", "text": str(e)}))
+                finally:
+                    setattr(self._agent, "_event_sink", prev)
+                    self.post_message(AgentEvent({"type": "idle"}))
+
+            threading.Thread(target=run_bg, daemon=True).start()
             return True
 
         if cmd in {"/calibration_tool", "/calibration-tool"}:
@@ -1506,6 +1564,7 @@ class ChatApp(App[None]):
                     self._agent.import_session(
                         {
                             "memory": [],
+                            "archive_memory": [],
                             "last_action_log": "(none yet)",
                             "scan_wait_pending": False,
                             "scan_wait_used": False,
@@ -1660,6 +1719,49 @@ class ChatApp(App[None]):
             self._append_block("Done", str(ev.get("say", "Finished.")))
             self._rerender_transcript_from_history()
             return
+        if t == "memory_compress":
+            phase = str(ev.get("phase", "") or "").strip().lower()
+            if phase == "start":
+                reason = str(ev.get("reason", "") or "").strip()
+                before = ev.get("before_tokens", None)
+                thr = ev.get("threshold_tokens", None)
+                msg = "Memory compression started."
+                if reason:
+                    msg += f" reason={reason}"
+                if before is not None:
+                    msg += f" before_tokens={before}"
+                if thr is not None:
+                    msg += f" threshold={thr}"
+                self._append_system(msg)
+                self._rerender_transcript_from_history()
+                return
+            if phase == "error":
+                reason = str(ev.get("reason", "") or "").strip()
+                err = str(ev.get("error", "") or "").strip()
+                msg = "Memory compression failed."
+                if reason:
+                    msg += f" reason={reason}"
+                if err:
+                    msg += f" error={err}"
+                self._append_error(msg)
+                self._rerender_transcript_from_history()
+                return
+            if phase == "done":
+                reason = str(ev.get("reason", "") or "").strip()
+                before = ev.get("before_tokens", None)
+                after = ev.get("after_tokens", None)
+                arch = ev.get("archive_entries", None)
+                memn = ev.get("memory_entries", None)
+                msg = "Memory compression finished."
+                if reason:
+                    msg += f" reason={reason}"
+                if before is not None and after is not None:
+                    msg += f" tokens={before}->{after}"
+                if memn is not None and arch is not None:
+                    msg += f" entries(memory={memn}, archive={arch})"
+                self._append_system(msg)
+                self._rerender_transcript_from_history()
+                return
         if t == "chat":
             txt = str(ev.get("text", "") or "").strip()
             if txt:

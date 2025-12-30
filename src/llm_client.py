@@ -5,6 +5,7 @@ import json
 import os
 import sys
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any, Iterable, Mapping, Optional
 
 from PIL import Image
@@ -29,6 +30,33 @@ def _extract_json_object(text: str) -> Mapping[str, Any]:
     if not isinstance(obj, dict):
         raise ValueError("Model JSON response must be an object.")
     return obj
+
+
+def estimate_tokens(*, text: str, model: str = "gpt-5.2") -> int:
+    """
+    Best-effort token estimate for the given text.
+
+    Uses `tiktoken` if available; otherwise falls back to a rough heuristic (~4 chars/token).
+    """
+    s = text or ""
+    try:
+        import tiktoken  # type: ignore
+
+        try:
+            enc = tiktoken.encoding_for_model(model)
+        except Exception:
+            enc = tiktoken.get_encoding("cl100k_base")
+        return int(len(enc.encode(s)))
+    except Exception:
+        # Conservative-ish fallback.
+        return max(1, int(len(s) / 4))
+
+
+def _try_extract_json_object(text: str) -> Optional[Mapping[str, Any]]:
+    try:
+        return _extract_json_object(text)
+    except Exception:
+        return None
 
 
 @dataclass(frozen=True, slots=True)
@@ -512,38 +540,257 @@ class OpenAiMultimodalClient:
         self,
         *,
         system_prompt: str,
+        mode: str,
+        plan_text: str | None = None,
         memory_entries: list[Mapping[str, Any]],
+        tool_results: list[Mapping[str, Any]] | None = None,
     ) -> Mapping[str, Any]:
         """
-        Summarize one run's memory entries.
+        Summarize one run (agent or chat).
 
         Returns JSON:
           { "summary": "<short>" }
         """
-        system = (
-            f"{system_prompt}\n\n"
-            "RUN SUMMARY MODE:\n"
-            "- Summarize the run based ONLY on the provided structured memory entries.\n"
-            "- Return ONLY one JSON object.\n"
-            '- JSON key: "summary" (required string).\n'
-            "- Keep it concise and actionable (what was done, key observations, where it ended).\n"
-        )
+        m = str(mode or "").strip().lower()
+        if m not in {"agent", "chat"}:
+            m = "agent"
+
+        if m == "agent":
+            system = (
+                f"{system_prompt}\n\n"
+                "RUN SUMMARY MODE (AGENT):\n"
+                "- Summarize what was done step-by-step, referencing tool calls/results when helpful.\n"
+                "- Include any deviations from the PLAN and how they were handled.\n"
+                "- Include a self-rating from 0 to 10.\n"
+                "- Return ONLY one JSON object.\n"
+                '- JSON key: "summary" (required string).\n'
+                "- The summary string MUST start with: 'Overall performance rating of this run: X/10.'\n"
+                "- Keep it concise but concrete; mention key observed states (e.g., <idle>, countdown=0s).\n"
+            )
+        else:
+            system = (
+                f"{system_prompt}\n\n"
+                "RUN SUMMARY MODE (CHAT):\n"
+                "- Summarize the conversation: key questions, answers, decisions, and any follow-ups.\n"
+                "- Do NOT claim to have executed tools.\n"
+                "- Return ONLY one JSON object.\n"
+                '- JSON key: "summary" (required string).\n'
+                "- Keep it concise and actionable (what was clarified / decided).\n"
+            )
         try:
             mem_json = json.dumps(list(memory_entries), ensure_ascii=False, default=str)
         except Exception:
             mem_json = "[]"
-        full_user = f"RUN MEMORY (structured):\n{mem_json}\n\nReturn ONLY valid JSON."
-        resp = self._client.responses.create(
-            model=self._config.model,
-            input=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": [{"type": "input_text", "text": full_user}]},
-            ],
-            tool_choice="none",
-            max_output_tokens=250,
-            timeout=self._config.timeout_s,
+        try:
+            tools_json = json.dumps(list(tool_results or []), ensure_ascii=False, default=str)
+        except Exception:
+            tools_json = "[]"
+        plan = str(plan_text or "").strip()
+        full_user = (
+            f"MODE: {m}\n\n"
+            f"PLAN TEXT:\n{plan if plan else '(none)'}\n\n"
+            f"TOOL RESULTS (structured):\n{tools_json}\n\n"
+            f"RUN MEMORY (structured):\n{mem_json}\n\n"
+            "Return ONLY valid JSON."
         )
-        self._set_last_usage(resp)
-        text = getattr(resp, "output_text", None) or ""
-        return _extract_json_object(text)
+        def call_once(*, sys_text: str, user_text: str, max_out: int) -> str:
+            resp = self._client.responses.create(
+                model=self._config.model,
+                input=[
+                    {"role": "system", "content": sys_text},
+                    {"role": "user", "content": [{"type": "input_text", "text": user_text}]},
+                ],
+                tool_choice="none",
+                max_output_tokens=max_out,
+                timeout=self._config.timeout_s,
+            )
+            self._set_last_usage(resp)
+            return getattr(resp, "output_text", None) or ""
+
+        # Retry with a "repair" prompt if the model returns malformed JSON.
+        last_text = call_once(sys_text=system, user_text=full_user, max_out=300)
+        obj = _try_extract_json_object(last_text)
+        if obj is not None:
+            return obj
+
+        repair_system = (
+            "You are a JSON repair assistant.\n"
+            "Given a previous model output that was supposed to be JSON, return ONLY a valid JSON object.\n"
+            "No markdown. No code fences. No extra text.\n"
+            'Return exactly: { "summary": "<string>" } and ensure all quotes/newlines are properly escaped.'
+        )
+        repair_user = (
+            f"MODE: {m}\n\n"
+            "Previous output (invalid JSON):\n"
+            f"{last_text}\n\n"
+            "Return ONLY valid JSON now."
+        )
+        last_text = call_once(sys_text=repair_system, user_text=repair_user, max_out=350)
+        obj = _try_extract_json_object(last_text)
+        if obj is not None:
+            return obj
+
+        # Final attempt: re-ask summarizer but with explicit JSON escaping guidance.
+        stricter_user = (
+            full_user
+            + "\n\nIMPORTANT: Return valid JSON. Do not include unescaped newlines inside strings; use \\n if needed."
+        )
+        last_text = call_once(sys_text=system, user_text=stricter_user, max_out=350)
+        obj = _try_extract_json_object(last_text)
+        if obj is not None:
+            return obj
+        raise ValueError(f"summarize_run: model did not return valid JSON. Last output: {last_text[:500]!r}")
+
+    def compression_memory(
+        self,
+        *,
+        system_prompt: str,
+        memory_entries: list[Mapping[str, Any]],
+        archive_memory_entries: list[Mapping[str, Any]] | None = None,
+        tool_results_by_run: Mapping[int, list[Mapping[str, Any]]] | None = None,
+    ) -> Mapping[str, Any]:
+        """
+        Compress agent memory by runs (run_index). Keeps one summary per run in `memory`,
+        and moves detailed entries to `archive_memory`.
+
+        Returns JSON:
+          { "memory": [...], "archive_memory": [...], "summaries": { "<run_index>": "<summary>" } }
+        """
+
+        def to_int(x: Any, default: int) -> int:
+            try:
+                if isinstance(x, bool):
+                    return default
+                return int(x)
+            except Exception:
+                return default
+
+        existing_archive: list[Mapping[str, Any]] = []
+        if isinstance(archive_memory_entries, list):
+            existing_archive = [e for e in archive_memory_entries if isinstance(e, Mapping)]
+
+        groups: dict[int, list[Mapping[str, Any]]] = {}
+        passthrough: list[Mapping[str, Any]] = []
+        for e in memory_entries or []:
+            if not isinstance(e, Mapping):
+                continue
+            if "run_index" not in e:
+                passthrough.append(e)
+                continue
+            ridx = to_int(e.get("run_index"), -1)
+            if ridx < 0:
+                passthrough.append(e)
+                continue
+            groups.setdefault(ridx, []).append(e)
+
+        compressed: list[Mapping[str, Any]] = list(passthrough)
+        archive: list[Mapping[str, Any]] = list(existing_archive)
+        summaries: dict[str, str] = {}
+
+        for run_index in sorted(groups.keys()):
+            entries = groups[run_index]
+            run_mode = "chat"
+            for e in entries:
+                m = str(e.get("mode", "")).strip().lower()
+                if m == "agent":
+                    run_mode = "agent"
+                    break
+
+            # If a run is already compressed (only summary entries remain), skip it to avoid
+            # duplicating archive entries indefinitely.
+            has_non_summary = False
+            for e in entries:
+                if not isinstance(e, Mapping):
+                    continue
+                if "summary_of_run" in e or "summary_of_last_run" in e:
+                    continue
+                has_non_summary = True
+                break
+            if not has_non_summary:
+                continue
+
+            existing_summary: str | None = None
+            for e in entries:
+                if not isinstance(e, Mapping):
+                    continue
+                v = e.get("summary_of_run", None)
+                if isinstance(v, str) and v.strip():
+                    existing_summary = v.strip()
+                    break
+                v = e.get("summary_of_last_run", None)
+                if isinstance(v, str) and v.strip():
+                    existing_summary = v.strip()
+                    break
+
+            summary = existing_summary
+            if summary is None:
+                plan_text = ""
+                for e in entries:
+                    v = e.get("plan_text", None)
+                    if isinstance(v, str) and v.strip():
+                        plan_text = v.strip()
+                        break
+                tools_for_run: list[Mapping[str, Any]] = []
+                if tool_results_by_run is not None:
+                    try:
+                        tools_for_run = list(tool_results_by_run.get(int(run_index), []) or [])
+                    except Exception:
+                        tools_for_run = []
+                try:
+                    out = self.summarize_run(
+                        system_prompt=system_prompt,
+                        mode=run_mode,
+                        plan_text=plan_text,
+                        memory_entries=list(entries),
+                        tool_results=tools_for_run,
+                    )
+                    summary = str(out.get("summary", "")).strip() or "Finished."
+                except Exception as e:
+                    # Never fail compression due to summary JSON issues; fall back to a minimal summary.
+                    if run_mode == "chat":
+                        msgs: list[str] = []
+                        for it in entries:
+                            um = it.get("user_message", None)
+                            ar = it.get("assistant_reply", None)
+                            if isinstance(um, str) and um.strip():
+                                msgs.append(f"Q: {um.strip()}")
+                            if isinstance(ar, str) and ar.strip():
+                                msgs.append(f"A: {ar.strip()}")
+                        snippet = " | ".join(msgs[-6:])
+                        summary = f"Chat run compressed (summary fallback due to error: {e}). {snippet}".strip()
+                    else:
+                        summary = f"Agent run compressed (summary fallback due to error: {e}).".strip()
+
+            summaries[str(int(run_index))] = summary
+            # Move original entries to archive, then keep only one summary entry in compressed memory.
+            archive.extend(entries)
+            compressed.append(
+                {
+                    "t": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                    "run_index": int(run_index),
+                    "mode": run_mode,
+                    "summary_of_run": summary,
+                }
+            )
+
+        return {"memory": compressed, "archive_memory": archive, "summaries": summaries}
+
+
+def compression_memory(
+    *,
+    client: OpenAiMultimodalClient,
+    system_prompt: str,
+    memory_entries: list[Mapping[str, Any]],
+    archive_memory_entries: list[Mapping[str, Any]] | None = None,
+    tool_results_by_run: Mapping[int, list[Mapping[str, Any]]] | None = None,
+) -> Mapping[str, Any]:
+    """
+    Convenience wrapper around `OpenAiMultimodalClient.compression_memory(...)`.
+    """
+    return client.compression_memory(
+        system_prompt=system_prompt,
+        memory_entries=memory_entries,
+        archive_memory_entries=archive_memory_entries,
+        tool_results_by_run=tool_results_by_run,
+    )
 

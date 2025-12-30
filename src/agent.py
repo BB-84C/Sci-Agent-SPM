@@ -11,7 +11,7 @@ from mcp.shared.memory import create_connected_server_and_client_session
 from .actions import ActionConfig, Actor
 from .abort import start_abort_hotkey
 from .capture import ScreenCapturer
-from .llm_client import LlmConfig, OpenAiMultimodalClient
+from .llm_client import LlmConfig, OpenAiMultimodalClient, estimate_tokens
 from .logger import RunLogger
 from .mcp_server import McpToolContext, create_mcp_server
 from .workspace import Workspace, load_workspace
@@ -42,6 +42,8 @@ class AgentConfig:
     memory_turns: int = -1
     # Internal observe retry count for unreadable ROIs.
     observe_max_retries: int = 5
+    # Auto-compress memory when estimated tokens exceed this threshold.
+    memory_compress_threshold_tokens: int = 300_000
 
 
 class VisualAutomationAgent:
@@ -74,6 +76,7 @@ class VisualAutomationAgent:
 
         self._plan_text: str = "(none)"
         self._memory: list[dict[str, Any]] = []
+        self._archive_memory: list[dict[str, Any]] = []
         self._run_index: int = 0
 
         self._last_action_log: str = "(none yet)"
@@ -202,10 +205,17 @@ class VisualAutomationAgent:
             raise ValueError("memory_turns must be -1 (full) or >= 0.")
         self.config = replace(self.config, memory_turns=memory_turns)
 
+    def set_memory_compress_threshold_tokens(self, threshold_tokens: int) -> None:
+        threshold_tokens = int(threshold_tokens)
+        if threshold_tokens < 0:
+            raise ValueError("memory_compress_threshold_tokens must be >= 0.")
+        self.config = replace(self.config, memory_compress_threshold_tokens=threshold_tokens)
+
     def export_session(self) -> Mapping[str, Any]:
         return {
             "plan_text": self._plan_text,
             "memory": list(self._memory),
+            "archive_memory": list(self._archive_memory),
             "run_index": int(self._run_index),
             "last_action_log": self._last_action_log,
             "tokens": {
@@ -220,6 +230,9 @@ class VisualAutomationAgent:
         mem = state.get("memory", None)
         if isinstance(mem, list) and all(isinstance(x, dict) for x in mem):
             self._memory = [dict(x) for x in mem]
+        arch = state.get("archive_memory", None)
+        if isinstance(arch, list) and all(isinstance(x, dict) for x in arch):
+            self._archive_memory = [dict(x) for x in arch]
         try:
             self._run_index = int(state.get("run_index", self._run_index))
         except Exception:
@@ -514,6 +527,111 @@ class VisualAutomationAgent:
             out.append(e)
         return out
 
+    def _tool_results_for_llm(self, *, tool_results: list[Mapping[str, Any]]) -> list[Mapping[str, Any]]:
+        """
+        Produce a compact, JSON-safe representation of tool results for LLM consumption.
+        """
+
+        def compact(v: Any) -> Any:
+            if v is None or isinstance(v, (str, int, float, bool)):
+                return v
+            if isinstance(v, list):
+                if len(v) > 20:
+                    return [compact(x) for x in v[:20]] + ["...(truncated)"]
+                return [compact(x) for x in v]
+            if isinstance(v, dict):
+                out: dict[str, Any] = {}
+                for k, vv in v.items():
+                    if len(out) >= 30:
+                        out["...(truncated)"] = True
+                        break
+                    if not isinstance(k, str):
+                        continue
+                    # Drop very large blobs/paths if present; keep top-level signals.
+                    if k in {"images", "last_images", "image", "screenshot", "raw", "data_url"}:
+                        continue
+                    out[k] = compact(vv)
+                return out
+            return str(v)
+
+        out: list[Mapping[str, Any]] = []
+        for item in tool_results or []:
+            if not isinstance(item, Mapping):
+                continue
+            tool = item.get("action", item.get("tool", None))
+            action_input = item.get("action_input", item.get("args", None))
+            result = item.get("result", None)
+            say = item.get("say", None)
+            out.append(
+                {
+                    "tool": None if tool is None else str(tool),
+                    "args": compact(action_input),
+                    "result": compact(result),
+                    "say": None if say is None else str(say),
+                }
+            )
+        return out
+
+    def _memory_token_estimate(self) -> int:
+        try:
+            s = json.dumps(list(self._memory), ensure_ascii=False, default=str)
+        except Exception:
+            s = str(self._memory)
+        return int(estimate_tokens(text=s, model=str(self.config.agent_model)))
+
+    def compress_memory(self, *, reason: str, tool_results_by_run: Optional[Mapping[int, list[Mapping[str, Any]]]] = None) -> Mapping[str, Any]:
+        """
+        Compress in-memory session history by runs, moving details to `archive_memory`.
+        Emits start/finish events for the TUI.
+        """
+        before_tokens = self._memory_token_estimate()
+        self._emit(
+            "memory_compress",
+            phase="start",
+            reason=str(reason or "").strip() or "(none)",
+            before_tokens=int(before_tokens),
+            threshold_tokens=int(getattr(self.config, "memory_compress_threshold_tokens", 0)),
+        )
+        try:
+            out = self.llm_agent.compression_memory(
+                system_prompt=SYSTEM_PROMPT,
+                memory_entries=list(self._memory),
+                archive_memory_entries=list(self._archive_memory),
+                tool_results_by_run=tool_results_by_run or {},
+            )
+            self._accumulate_last_usage(self.llm_agent)
+        except Exception as e:
+            self._emit(
+                "memory_compress",
+                phase="error",
+                reason=str(reason or "").strip() or "(none)",
+                before_tokens=int(before_tokens),
+                error=str(e),
+            )
+            raise
+        mem_new = out.get("memory", None)
+        arch_new = out.get("archive_memory", None)
+        if isinstance(mem_new, list) and all(isinstance(x, Mapping) for x in mem_new):
+            self._memory = [dict(x) for x in mem_new]  # type: ignore[arg-type]
+        if isinstance(arch_new, list) and all(isinstance(x, Mapping) for x in arch_new):
+            self._archive_memory = [dict(x) for x in arch_new]  # type: ignore[arg-type]
+        after_tokens = self._memory_token_estimate()
+        self._emit(
+            "memory_compress",
+            phase="done",
+            reason=str(reason or "").strip() or "(none)",
+            before_tokens=int(before_tokens),
+            after_tokens=int(after_tokens),
+            archive_entries=int(len(self._archive_memory)),
+            memory_entries=int(len(self._memory)),
+        )
+        return {
+            "before_tokens": int(before_tokens),
+            "after_tokens": int(after_tokens),
+            "archive_entries": int(len(self._archive_memory)),
+            "memory_entries": int(len(self._memory)),
+        }
+
     def Chat(
         self,
         *,
@@ -741,7 +859,16 @@ class VisualAutomationAgent:
         self.logger.narrate(f"Run index: {run_index}")
 
         if mode == "chat":
-            return self.Chat(user_command=user_command, run_index=run_index, openai_tools=openai_tools, workspace_info=workspace_info)
+            out = self.Chat(user_command=user_command, run_index=run_index, openai_tools=openai_tools, workspace_info=workspace_info)
+            # Auto-compress after chat turns if memory grows too large.
+            thr = int(getattr(self.config, "memory_compress_threshold_tokens", 0))
+            if thr > 0:
+                try:
+                    if self._memory_token_estimate() >= thr:
+                        self.compress_memory(reason=f"auto_threshold_reached({thr})")
+                except Exception:
+                    pass
+            return out
 
         results, finished = self.ReAct(
             user_command=user_command, run_index=run_index, openai_tools=openai_tools, workspace_info=workspace_info
@@ -756,7 +883,13 @@ class VisualAutomationAgent:
                 and "summary_of_run" not in e
                 and "summary_of_last_run" not in e
             ]
-            summary_obj = self.llm_agent.summarize_run(system_prompt=SYSTEM_PROMPT, memory_entries=run_mem)
+            summary_obj = self.llm_agent.summarize_run(
+                system_prompt=SYSTEM_PROMPT,
+                mode="agent",
+                plan_text=self._plan_text,
+                memory_entries=run_mem,
+                tool_results=self._tool_results_for_llm(tool_results=results),
+            )
             self._accumulate_last_usage(self.llm_agent)
             summary = str(summary_obj.get("summary", "")).strip() or "Finished."
             self._memory.append(
@@ -768,6 +901,15 @@ class VisualAutomationAgent:
                 }
             )
             self._emit("finish", say=summary)
+
+        # Auto-compress after agent runs if memory grows too large.
+        thr = int(getattr(self.config, "memory_compress_threshold_tokens", 0))
+        if thr > 0:
+            try:
+                if self._memory_token_estimate() >= thr:
+                    self.compress_memory(reason=f"auto_threshold_reached({thr})")
+            except Exception:
+                pass
 
         self.logger.narrate(f"Logs: {self.logger.run_root}")
         return results

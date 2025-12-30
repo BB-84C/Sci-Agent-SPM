@@ -20,6 +20,7 @@ class TuiSettings:
     log_dir: Optional[str] = None
     memory_turns: Optional[int] = None
     mode: Optional[str] = None  # agent|chat|auto
+    memory_compress_threshold_tokens: Optional[int] = None
 
 
 def _coerce_str(v: Any) -> Optional[str]:
@@ -87,6 +88,7 @@ def load_tui_settings(path: Path = DEFAULT_SETTINGS_PATH) -> TuiSettings:
         log_dir=_coerce_str(obj.get("log_dir")),
         memory_turns=_coerce_int(obj.get("memory_turns")),
         mode=_coerce_str(obj.get("mode")),
+        memory_compress_threshold_tokens=_coerce_int(obj.get("memory_compress_threshold_tokens")),
     )
 
 
@@ -118,4 +120,7 @@ def merge_settings(base: TuiSettings, overrides: Mapping[str, Any]) -> TuiSettin
         log_dir=_coerce_str(o.get("log_dir", base.log_dir)),
         memory_turns=_coerce_int(o.get("memory_turns", base.memory_turns)),
         mode=_coerce_str(o.get("mode", base.mode)),
+        memory_compress_threshold_tokens=_coerce_int(
+            o.get("memory_compress_threshold_tokens", base.memory_compress_threshold_tokens)
+        ),
     )
