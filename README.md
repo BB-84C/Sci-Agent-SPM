@@ -1,6 +1,6 @@
 # Sci-Agent-SPM
 
-![alt text](.\assets\image.png)
+![alt text](./assets/image.png)
 
 A **visual automation agent** for running **Scanning Probe Microscope (SPM)** instruments:
 
