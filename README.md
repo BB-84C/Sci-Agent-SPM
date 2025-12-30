@@ -1,15 +1,67 @@
-# Sci-Agent-STM (MVP)
+# Sci-Agent-SPM
 
-Windows desktop “visual automation agent” MVP for driving the **Nanonis SPM Control Software** UI using:
-- screenshots (full screen + ROIs)
-- fixed pixel click anchors
-- multimodal agent verification (ROI images)
+A **visual automation agent** for running **Scanning Probe Microscope (SPM)** instruments:
 
-No NPI, no reverse engineering, no UI element inspection.
+- **Pure GUI automation**: runs directly on the SPM controller software (e.g., Nanonis) as-is — **no instrument API** required, no NPI integration.
+- **Fast setup**: calibrate a workspace once and start automating in minutes.
+- **Long-horizon execution**: ReAct based operation that can carry multi-step experiments across different open-ended experimental scenarios and run stably over a long period of time. Translation: it helps you do experiments while you sleep.
+- **Structured context + modular memory**: persistent sessions, structured run memory, and automatic memory compression.
 
-## Setup
 
-### 1) Create a venv
+## What It Can Do
+
+Sci-Agent-SPM is designed for UI-driven lab automation where “integration” is impossible or undesirable.
+
+- **Type into fields** and **click buttons** using calibrated anchors.
+- **Verify outcomes** by re-checking ROIs linked to the action (post-action observation is automatic when anchors have `linked_ROIs`).
+- **Wait like an operator** with ROI-aware sleeps (`wait_until`) that can follow visible countdowns.
+- **Run in different modes**:
+  - `agent`: automation with tools (click/type/wait).
+  - `chat`: model-only reasoning and planning (no UI side effects).
+  - `auto`: the model classifies whether your message should be `agent` or `chat`.
+
+## How It Runs (Architecture)
+
+At runtime, the agent is a tight “pixels in → actions out” loop:
+
+- **Capture**: ROI screenshots via `mss` + `Pillow` (`src/capture.py`).
+- **Act**: mouse/keyboard via `pyautogui` (`src/actions.py`) using your calibrated anchors.
+- **Decide**: two-model design (`src/agent.py`):
+  - `agent_model`: decides what to do next and updates structured memory.
+  - `tool_call_model`: cheap “perception” model used for ROI reading / waiting decisions.
+- **Tools**: exposed through an in-process **MCP server** so schemas are discoverable and the agent can “call tools” in a controlled way (`src/mcp_server.py`).
+- **Memory**: structured session memory with optional “keep last N turns” and on-demand / threshold-based compression (`/compress_memory`).
+
+## Quickstart (Recommended)
+
+From the repo root, run the bootstrap script:
+
+```powershell
+.\Sci-Agent-SPM.ps1
+```
+
+It will:
+- create `.venv` if needed
+- install dependencies from `requirements.txt`
+- create `workspace.json` from `workspace.example.json` (if missing)
+- prompt for `OPENAI_API` (if missing) and start the TUI
+
+Optional: install a user-level `Sci-Agent-SPM` command (copies a shim to `~\.local\bin` and adds it to your user `PATH`):
+
+```powershell
+.\tools\install_sci_agent_spm.ps1
+```
+
+## Setup (Manual)
+
+### Prerequisites
+
+- Windows 10/11
+- Python 3.11+ on PATH
+- Your own SPM controlling software, (eg: Nanonis SPM Control Software) running on a stable monitor layout
+- An OpenAI API key (`OPENAI_API` or `OPENAI_API_KEY`)
+
+### 1) Create a venv + install deps
 
 ```powershell
 python -m venv .venv
@@ -17,9 +69,9 @@ python -m venv .venv
 .\.venv\Scripts\python -m pip install -r requirements.txt
 ```
 
-### 2) Configure UI mappings (workspace)
+### 2) Calibrate your `workspace.json` (ROIs + Anchors)
 
-This MVP assumes the Nanonis window layout/resolution is stable and you calibrate coordinates once.
+This agent is deliberately “dumb” about UI structure: it only knows the rectangles and points you give it.
 
 Option A (recommended): use the GUI calibrator:
 
@@ -29,17 +81,31 @@ Option A (recommended): use the GUI calibrator:
 
 In the calibrator:
 - Add/select an ROI or Anchor in the left list
-- Click “Draw ROI box” (drag a rectangle) or “Pick anchor point” (single click)
-- Click “Save” to write `workspace.json`
+- Click **Draw ROI box** (drag a rectangle) or **Pick anchor point** (single click)
+- Describe the ROI as best as possible. For example: 
+```json
+"name": "set_current_readout",
+
+"description": "ROI covering the displayed set current value (A) in Nanonis. It does not always equal to the real current. Since this set current is only used in the constant-current-scanning mode to set the current that STM tries to maintain. But the actual real current depends on the tip's microscopical geometry and the electronic status. "
+```
+- (Optional) For anchors, link ROIs in **Linked ROIs** so the agent auto-checks them after using that anchor
+- Click **Save**
 
 Option B: edit JSON directly:
 
 1. Copy `workspace.example.json` → `workspace.json`
-2. Edit the ROI rectangles and anchor coordinates:
-   - `rois`: screenshot-only regions (readouts, status panels)
+2. Edit:
+   - `rois`: screenshot regions (readouts, status panels, countdowns)
    - `anchors`: click targets (input boxes, buttons)
+   - `linked_ROIs` (anchor only): ROIs to observe after that action for verification
 
-Tip: Use a screen ruler tool or a quick one-off script to print mouse coordinates.
+### 3) Set your OpenAI key
+
+```powershell
+$env:OPENAI_API = "YOUR_KEY_HERE"
+```
+
+The bootstrap script also loads `OPENAI_API` / `OPENAI_API_KEY` from a local `.env` file if present.
 
 ## Run
 
@@ -47,87 +113,83 @@ Tip: Use a screen ruler tool or a quick one-off script to print mouse coordinate
 .\.venv\Scripts\python -m src.main --agent
 ```
 
-### One-command bootstrap + run
+## How To Use It
 
-From the repo root, this script will create a venv (if needed), install deps, ensure `workspace.json`, prompt for your OpenAI key (if missing), and start the TUI:
+### 1) Think in anchors + ROIs
 
-```powershell
-.\Sci-Agent-STM.ps1
-```
+The agent cannot “find the Bias field” unless you gave it:
+- an anchor like `bias_input` (where to click/type)
+- ROIs like `bias_readout`, `scan_status`, `scan_time_count_down` (what to verify / wait on)
 
-Optional: install a user-level `Sci-Agent-STM` command (adds `~\.local\bin` to your user `PATH` if needed):
+Link the right ROIs to the right anchors to make verification automatic.
 
-```powershell
-.\tools\install_sci_agent_stm.ps1
-```
+### 2) Give it a real operator command
 
-### Agent mode (LLM, multimodal)
+In `agent` mode, you can ask for sequences like:
+- “Set bias to 500 mV, start one topography scan, wait until status returns to `<idle>`, then set 400 mV and repeat.”
 
-Set your OpenAI key in `OPENAI_API` (or `OPENAI_API_KEY`):
+In `chat` mode, ask for planning, SOP drafting, or sanity checks without touching the controlling software.
 
-```powershell
-$env:OPENAI_API = "YOUR_KEY_HERE"
-```
+### 3) TUI controls (slash commands)
 
-Make sure your current Python has the `openai` package installed (recommended: use the repo venv):
+In the TUI, type `/help` (or `/menu`) to show commands. Settings persist in `sessions/.tui_settings.json`.
 
-```powershell
-.\.venv\Scripts\python -m pip install -r requirements.txt
-```
+**Core settings**
+- `/workspace [path]`: get/set the active workspace file.
+- `/mode`: show current mode.
+- `/mode agent|chat|auto`: set execution mode.
+- `/agent_model [name]` (alias: `/model`): get/set the main “decision” model.
+- `/tool_call_model [name]`: get/set the perception/tool helper model.
+- `/max_agent_steps [int]`: limit steps per run (prevents runaway loops).
+- `/action_delay [seconds]`: delay between UI actions (stability vs speed).
+- `/abort_hotkey [on|off]`: enable/disable cooperative abort from the TUI (Ctrl+C).
+- `/log_dir [path]`: set where runs write logs (default: `logs`).
 
-Run with `--agent` (uses `gpt-5.2` by default):
+**Memory**
+- `/memory_turn`: show current `memory_turns`.
+- `/set_memory_turn [-1|N]`: `-1` = full memory; `0` = none; `N` = keep last N entries.
+- `/memory_compress_threshold [int tokens]`: set auto-compress threshold (`0` disables auto-compress).
+- `/compress_memory`: manually compress memory now (moves details to archive and keeps summaries).
 
-```powershell
-.\.venv\Scripts\python -m src.main --agent
-```
+**Sessions**
+- `/chat new`: start a new session (clears transcript + memory).
+- `/chat save [name]`: save current transcript + agent state to `sessions/<name>.json`.
+- `/chat list`: list saved sessions.
+- `/chat resume <name>`: load a saved session.
 
-In the TUI, settings are controlled via slash commands:
+**Maintenance**
+- `/calibration_tool`: launch the calibrator for the current workspace.
+- `/clear_cache`: delete log folders on disk (asks for confirmation).
 
-- `/workspace [path]` (default: `workspace.json`)
-- `/model [name]` (get/set)
-- `/max_agent_steps [int]` (get/set)
-- `/log_dir [path]` (get/set)
+### 4) TUI key bindings
 
-Chat commands:
-- `/help` (or `/menu`) shows available commands
-- `/chat save [name]` saves the current transcript + agent memory to `sessions/`
-- `/chat list` lists saved sessions
-- `/chat resume <name>` loads a saved session
+- `Enter`: newline
+- `Ctrl+S`: send input
+- `Ctrl+I`: focus input
+- `Ctrl+L`: focus transcript
+- `Shift+Mouse`: select/copy transcript (Esc to close)
+- `Ctrl+Q`: quit
+- `PageUp` / `PageDown`: scroll transcript
+- `Ctrl+C`: request abort (when `/abort_hotkey` is ON)
 
-## Scan countdown pause (optional)
+### 5) Logs (audit trail)
 
-If you add an ROI named `scan_time_count_down` (with a clear description of the time format), the agent can use a `pause_scan` tool to read the remaining time from that ROI, wait for the countdown + 5 seconds, then continue. This prevents the agent from spamming observations while a scan is running.
+Each program run creates a timestamped folder under `logs/` (or your configured `/log_dir`).
 
-Abort options:
-- Move mouse to top-left corner (pyautogui failsafe)
-- Press `ESC` (toggle in TUI: `/abort_hotkey on|off`)
+Typical structure:
 
-## Logs
+`logs/<YYYYMMDD_HHMMSS>/`
+- `click_<anchor>/meta.json`
+- `set_field_<anchor>/meta.json`
+- `wait_until_<roi>_sleep/meta.json` + `before_<roi>.png`
+- `observe_<attempt>_<roi>/meta.json` + `roi_<roi>.png`
 
-Each run creates a folder under `logs/`:
+These logs are designed to make automation reviewable: you can inspect exactly what the agent saw and did.
 
-`logs/<timestamp>/`
-- `<step_name>/`
-  - `before.png` / `after.png` (when exactly one ROI is captured for the step)
-  - `before_<roi>.png` / `after_<roi>.png`
-  - `meta.json` (step details)
+## Safety
 
-The system always saves before/after images per step. In agent mode, the model uses ROI images + the last action log to judge whether the UI changed as intended.
+This project can control your mouse/keyboard.
 
-Example console output:
-
-```text
-Plan:
-  1. Use `--agent` mode to set a field and click anchors.
-Workspace: workspace.json
-Dry-run: False
-Failsafe: move mouse to top-left to abort (pyautogui.FAILSAFE)
-Abort hotkey: ESC
-[Agent] Use `set_field`/`click_anchor` actions with anchors from your workspace.
-Logs: logs/20251223_143012
-```
-
-## Verification
-
-- Rule-based mode: screenshot logging only (no automatic verification)
-- Agent mode: multimodal model checks ROI images + action log
+- **PyAutoGUI failsafe**: move the mouse to the top-left corner to trigger `pyautogui.FAILSAFE`.
+- Prefer running on a dedicated machine / dedicated desktop session so other apps don’t steal focus.
+- Start with conservative `/action_delay` and small `/max_agent_steps` until your workspace is calibrated and stable.

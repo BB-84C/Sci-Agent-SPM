@@ -23,8 +23,8 @@ function Ensure-PathContains([string]$dir) {
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $bin = Ensure-BinDir
 
-$shim = Join-Path $bin "Sci-Agent-STM.cmd"
-$target = Join-Path $repoRoot "Sci-Agent-STM.cmd"
+$shim = Join-Path $bin "Sci-Agent-SPM.cmd"
+$target = Join-Path $repoRoot "Sci-Agent-SPM.cmd"
 
 if (-not (Test-Path $target)) {
     throw "Expected $target to exist. Run this from the repo after pulling the bootstrap scripts."
@@ -34,4 +34,4 @@ Copy-Item -LiteralPath $target -Destination $shim -Force
 Ensure-PathContains -dir $bin
 
 Write-Host "Installed: $shim"
-Write-Host "Open a new terminal and run: Sci-Agent-STM"
+Write-Host "Open a new terminal and run: Sci-Agent-SPM"

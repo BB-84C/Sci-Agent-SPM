@@ -29,7 +29,7 @@ def create_mcp_server(*, agent: Any) -> FastMCP:
     `mcp_session.list_tools()`.
     """
 
-    mcp = FastMCP("sci-agent-stm")
+    mcp = FastMCP("sci-agent-spm")
 
     def _ctx() -> McpToolContext:
         ctx = getattr(agent, "_mcp_tool_ctx", None)
