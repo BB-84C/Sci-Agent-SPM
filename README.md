@@ -1,5 +1,7 @@
 # Sci-Agent-SPM
 
+![alt text](.\assets\image.png)
+
 A **visual automation agent** for running **Scanning Probe Microscope (SPM)** instruments:
 
 - **Pure GUI automation**: runs directly on the SPM controller software (e.g., Nanonis) as-is — **no instrument API** required, no NPI integration.
