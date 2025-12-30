@@ -37,6 +37,7 @@ class AgentConfig:
     action_delay_s: float = 0.25
     log_dir: str = "logs"
     abort_hotkey: bool = True
+    run_mode: Literal["agent", "chat", "auto"] = "agent"
     # -1: pass full structured memory; otherwise keep last N entries.
     memory_turns: int = -1
     # Internal observe retry count for unreadable ROIs.
@@ -59,7 +60,7 @@ class VisualAutomationAgent:
         self.capturer = ScreenCapturer()
         self._event_sink = event_sink
 
-        abort = start_abort_hotkey() if config.abort_hotkey else None
+        abort = start_abort_hotkey(key="none") if config.abort_hotkey else None
         self._abort = abort
         self.actor = Actor(
             config=ActionConfig(delay_s=config.action_delay_s),
@@ -73,6 +74,7 @@ class VisualAutomationAgent:
 
         self._plan_text: str = "(none)"
         self._memory: list[dict[str, Any]] = []
+        self._run_index: int = 0
 
         self._last_action_log: str = "(none yet)"
         # Tool back-compat fields (not used by the new orchestrator logic).
@@ -95,6 +97,23 @@ class VisualAutomationAgent:
             self._event_sink({"type": event_type, **payload})
         except Exception:
             pass
+
+    def _abort_is_set(self) -> bool:
+        try:
+            return bool(self._abort is not None and self._abort.event.is_set())
+        except Exception:
+            return False
+
+    def _clear_abort(self) -> None:
+        try:
+            if self._abort is not None:
+                self._abort.event.clear()
+        except Exception:
+            pass
+
+    def _raise_if_aborted(self) -> None:
+        if self._abort_is_set():
+            raise KeyboardInterrupt()
 
     def set_model(self, model: str) -> None:
         # Backwards compatibility: treat `/model` as `/agent_model`.
@@ -121,6 +140,12 @@ class VisualAutomationAgent:
             raise ValueError("max_steps must be > 0.")
         self.config = replace(self.config, max_steps=max_steps)
 
+    def set_run_mode(self, mode: str) -> None:
+        m = str(mode or "").strip().lower()
+        if m not in {"agent", "chat", "auto"}:
+            raise ValueError("mode must be one of: agent | chat | auto")
+        self.config = replace(self.config, run_mode=m)  # type: ignore[arg-type]
+
     def set_action_delay_s(self, delay_s: float) -> None:
         delay_s = float(delay_s)
         if delay_s < 0:
@@ -134,7 +159,7 @@ class VisualAutomationAgent:
 
         if enabled:
             if self._abort is None:
-                self._abort = start_abort_hotkey()
+                self._abort = start_abort_hotkey(key="none")
                 self.actor.set_abort_event(self._abort.event)
             return
 
@@ -144,6 +169,22 @@ class VisualAutomationAgent:
             finally:
                 self._abort = None
         self.actor.set_abort_event(None)
+
+    def request_abort(self) -> None:
+        """
+        Request a cooperative abort for the current run (if supported).
+
+        This sets the internal abort event used by the Actor and other long-running loops.
+        """
+        if self._abort is None:
+            if not bool(self.config.abort_hotkey):
+                return
+            self._abort = start_abort_hotkey(key="none")
+            self.actor.set_abort_event(self._abort.event)
+        try:
+            self._abort.event.set()
+        except Exception:
+            pass
 
     def set_log_dir(self, log_dir: str) -> None:
         log_dir = log_dir.strip()
@@ -165,6 +206,7 @@ class VisualAutomationAgent:
         return {
             "plan_text": self._plan_text,
             "memory": list(self._memory),
+            "run_index": int(self._run_index),
             "last_action_log": self._last_action_log,
             "tokens": {
                 "input_tokens": self._tokens_in,
@@ -178,6 +220,10 @@ class VisualAutomationAgent:
         mem = state.get("memory", None)
         if isinstance(mem, list) and all(isinstance(x, dict) for x in mem):
             self._memory = [dict(x) for x in mem]
+        try:
+            self._run_index = int(state.get("run_index", self._run_index))
+        except Exception:
+            pass
         self._last_action_log = str(state.get("last_action_log", self._last_action_log))
         toks = state.get("tokens", None)
         if isinstance(toks, dict):
@@ -333,6 +379,7 @@ class VisualAutomationAgent:
         if not rois:
             return {"rois": [], "results": {}, "unreadable": []}
 
+        self._raise_if_aborted()
         resolved = []
         for r in rois:
             rr = str(r).strip()
@@ -345,6 +392,7 @@ class VisualAutomationAgent:
         last: Mapping[str, Any] = {"rois": roi_names, "results": {}, "unreadable": list(roi_names)}
         attempts = max(1, int(self.config.observe_max_retries))
         for attempt in range(1, attempts + 1):
+            self._raise_if_aborted()
             images = [self.capturer.capture_roi(roi) for roi in resolved]
             roi_items = list(zip(roi_names, roi_descs, images))
 
@@ -352,8 +400,10 @@ class VisualAutomationAgent:
             for name, _desc, img in roi_items:
                 step.save_image(f"roi_{name}.png", img)
 
+            self._raise_if_aborted()
             extracted = self.llm_tool.observe_rois(roi_items=roi_items)
             self._accumulate_last_usage(self.llm_tool)
+            self._raise_if_aborted()
 
             results = extracted.get("results", {})
             unreadable = extracted.get("unreadable", [])
@@ -403,6 +453,7 @@ class VisualAutomationAgent:
         tools: list[Mapping[str, Any]],
         workspace_info: Mapping[str, Any],
     ) -> Mapping[str, Any]:
+        self._raise_if_aborted()
         out = self.llm_agent.update_memory_step(
             system_prompt=SYSTEM_PROMPT,
             user_command=user_command,
@@ -414,6 +465,7 @@ class VisualAutomationAgent:
             tools=list(tools),
         )
         self._accumulate_last_usage(self.llm_agent)
+        self._raise_if_aborted()
 
         rationale = str(out.get("rationale", "")).strip()
         next_action = out.get("next_action", None)
@@ -435,10 +487,218 @@ class VisualAutomationAgent:
         resolved_linked = self._resolve_linked_rois({"tool": tool_name, "args": args, "linked_rois": linked_rois})
         return {"rationale": rationale, "next_action": {"tool": tool_name, "args": dict(args), "linked_rois": resolved_linked}}
 
+    def _tool_schemas_text(self, *, openai_tools: list[Mapping[str, Any]]) -> str:
+        parts: list[str] = []
+        for t in openai_tools:
+            name = str(t.get("name", "")).strip()
+            desc = str(t.get("description", "")).strip()
+            params = t.get("parameters", {})
+            try:
+                schema = json.dumps(params, ensure_ascii=False)
+            except Exception:
+                schema = "{}"
+            if name:
+                parts.append(f"- {name}: {desc}\n  inputSchema: {schema}")
+        return "\n".join(parts) if parts else "(none)"
+
+    def _memory_for_run(self, *, run_index: int) -> list[dict[str, Any]]:
+        out: list[dict[str, Any]] = []
+        for e in self._memory:
+            if not isinstance(e, dict):
+                continue
+            try:
+                if int(e.get("run_index", -1)) != int(run_index):
+                    continue
+            except Exception:
+                continue
+            out.append(e)
+        return out
+
+    def Chat(
+        self,
+        *,
+        user_command: str,
+        run_index: int,
+        openai_tools: list[Mapping[str, Any]],
+        workspace_info: Mapping[str, Any],
+    ) -> list[Mapping[str, Any]]:
+        tools_text = self._tool_schemas_text(openai_tools=openai_tools)
+        self._raise_if_aborted()
+        reply_obj = self.llm_agent.chat_reply(
+            system_prompt=SYSTEM_PROMPT,
+            user_message=user_command,
+            memory_entries=list(self._memory),
+            workspace_info=dict(workspace_info),
+            tools_text=tools_text,
+        )
+        self._accumulate_last_usage(self.llm_agent)
+        self._raise_if_aborted()
+        reply = str(reply_obj.get("reply", "")).strip()
+        if not reply:
+            reply = "(no reply)"
+
+        self._memory.append(
+            {
+                "t": self._now_iso(),
+                "run_index": int(run_index),
+                "mode": "chat",
+                "user_message": user_command,
+                "assistant_reply": reply,
+            }
+        )
+        self._emit("chat", text=reply)
+        return [{"mode": "chat", "reply": reply}]
+
+    def ReAct(
+        self,
+        *,
+        user_command: str,
+        run_index: int,
+        openai_tools: list[Mapping[str, Any]],
+        workspace_info: Mapping[str, Any],
+    ) -> tuple[list[Mapping[str, Any]], bool]:
+        results: list[dict[str, Any]] = []
+        known_tools = {str(t.get("name", "")).strip() for t in openai_tools if str(t.get("name", "")).strip()}
+
+        try:
+            self._raise_if_aborted()
+            plan_out = self.llm_agent.plan_step(
+                system_prompt=SYSTEM_PROMPT,
+                user_prompt=user_command,
+                memory_entries=self._memory_entries_for_llm(),
+                workspace_info=dict(workspace_info),
+                tools_text=self._tool_schemas_text(openai_tools=openai_tools),
+            )
+            self._accumulate_last_usage(self.llm_agent)
+            self._raise_if_aborted()
+            self._plan_text = str(plan_out.get("plan_text", "")).strip() or "(none)"
+        except Exception:
+            self._plan_text = "(none)"
+
+        self._emit("plan_text", text=self._plan_text)
+
+        finished = False
+        self._raise_if_aborted()
+        seed = self._update_memory(
+            user_command=user_command,
+            last_action_done=None,
+            observation_of_last_action=None,
+            tools=list(openai_tools),
+            workspace_info=dict(workspace_info),
+        )
+        self._memory.append(
+            {
+                "t": self._now_iso(),
+                "run_index": int(run_index),
+                "mode": "agent",
+                "user_message": user_command,
+                "plan_text": self._plan_text,
+                "last_action_done": None,
+                "observation_of_last_action": None,
+                "rationale": str(seed["rationale"]),
+                "next_action": dict(seed["next_action"]),
+            }
+        )
+
+        for step_index in range(1, int(self.config.max_steps) + 1):
+            self._raise_if_aborted()
+            current = self._memory[-1]
+            next_action = current.get("next_action", {})
+            if not isinstance(next_action, dict):
+                raise RuntimeError("Missing next_action in memory.")
+
+            tool_name = str(next_action.get("tool", "")).strip()
+            tool_args = next_action.get("args", {})
+            if not isinstance(tool_args, dict):
+                tool_args = {}
+            if tool_name not in known_tools:
+                raise RuntimeError(f"Unknown tool requested: {tool_name!r}")
+
+            self._raise_if_aborted()
+            signature = self._call_signature(tool_name=tool_name, tool_args=tool_args)
+            flow = self._call_mcp_tool(
+                tool_name=tool_name,
+                tool_args=tool_args,
+                step_index=step_index,
+                signature=signature,
+                results=results,
+            )
+            self._raise_if_aborted()
+
+            last_action_done: dict[str, Any] = {
+                "tool": tool_name,
+                "args": dict(tool_args),
+                "status": "finished",
+                "error": None,
+            }
+
+            observed_rois = self._resolve_linked_rois(next_action)
+            observation_of_last_action: Optional[Mapping[str, Any]] = None
+            if observed_rois:
+                observation_of_last_action = self._observe(rois=observed_rois)
+
+            self._raise_if_aborted()
+            out = self._update_memory(
+                user_command=user_command,
+                last_action_done=last_action_done,
+                observation_of_last_action=observation_of_last_action,
+                tools=list(openai_tools),
+                workspace_info=dict(workspace_info),
+            )
+
+            entry = {
+                "t": self._now_iso(),
+                "run_index": int(run_index),
+                "mode": "agent",
+                "last_action_done": last_action_done,
+                "observation_of_last_action": observation_of_last_action,
+                "rationale": str(out["rationale"]),
+                "next_action": dict(out["next_action"]),
+            }
+            self._memory.append(entry)
+
+            self._raise_if_aborted()
+            narration = self.llm_agent.narrate_react_step(
+                system_prompt=SYSTEM_PROMPT,
+                last_action_done=last_action_done,
+                observation_of_last_action=observation_of_last_action,
+                rationale=str(out["rationale"]),
+                next_action=dict(out["next_action"]),
+            )
+            self._accumulate_last_usage(self.llm_agent)
+            self._raise_if_aborted()
+
+            if not isinstance(narration, dict):
+                narration = {}
+
+            self._emit(
+                "step_blocks",
+                step=step_index,
+                action=str(narration.get("action", "")).strip(),
+                observe=str(narration.get("observe", "")).strip(),
+                think=str(narration.get("think", "")).strip(),
+                next=str(narration.get("next", "")).strip(),
+                raw=entry,
+            )
+
+            self._last_action_log = f"{tool_name}({tool_args})"
+
+            if flow == "break":
+                finished = (tool_name == "finish")
+                break
+            if str(out["next_action"].get("tool", "")).strip() == "finish":
+                finished = True
+                break
+
+        return results, finished
+
     def run(self, *, user_command: str) -> list[Mapping[str, Any]]:
         user_command = str(user_command or "").strip()
         if not user_command:
             return []
+
+        # Reset abort flag for a new run so a previous Ctrl+C doesn't permanently poison future runs.
+        self._clear_abort()
 
         # Reload workspace on each run so chat sessions track user edits (add/delete ROIs/anchors).
         try:
@@ -446,202 +706,74 @@ class VisualAutomationAgent:
         except Exception:
             pass
 
-        self.logger.narrate(f"Workspace: {self.workspace.source_path}")
-        self.logger.narrate(
-            f"Agent mode: True (agent_model={self.config.agent_model}, tool_call_model={self.config.tool_call_model})"
-        )
-        self.logger.narrate("Failsafe: move mouse to top-left to abort (pyautogui.FAILSAFE)")
-        if self.config.abort_hotkey:
-            self.logger.narrate("Abort hotkey: ESC")
-
-        results: list[dict[str, Any]] = []
         openai_tools = self._openai_tools()
-        known_tools = {str(t.get("name", "")).strip() for t in openai_tools if str(t.get("name", "")).strip()}
         workspace_info = self._workspace_info()
 
-        def tool_schemas_text() -> str:
-            parts: list[str] = []
-            for t in openai_tools:
-                name = str(t.get("name", "")).strip()
-                desc = str(t.get("description", "")).strip()
-                params = t.get("parameters", {})
-                try:
-                    schema = json.dumps(params, ensure_ascii=False)
-                except Exception:
-                    schema = "{}"
-                if name:
-                    parts.append(f"- {name}: {desc}\n  inputSchema: {schema}")
-            return "\n".join(parts) if parts else "(none)"
+        mode = str(self.config.run_mode)
+        if mode == "auto":
+            try:
+                self._raise_if_aborted()
+                classified = self.llm_agent.classify_run_mode(system_prompt=SYSTEM_PROMPT, user_message=user_command)
+                self._accumulate_last_usage(self.llm_agent)
+                self._raise_if_aborted()
+                m = str(classified.get("mode", "")).strip().lower()
+                if m in {"agent", "chat"}:
+                    mode = m
+            except Exception:
+                mode = "agent"
 
-        try:
-            plan_out = self.llm_agent.plan_step(
-                system_prompt=SYSTEM_PROMPT,
-                user_prompt=user_command,
-                memory_entries=self._memory_entries_for_llm(),
-                workspace_info=workspace_info,
-                tools_text=tool_schemas_text(),
-            )
+        last_mode: Optional[str] = None
+        if self._memory:
+            try:
+                last_mode = str(self._memory[-1].get("mode", "")).strip().lower()  # type: ignore[union-attr]
+            except Exception:
+                last_mode = None
+
+        should_bump = (mode == "agent") or (mode == "chat" and last_mode != "chat")
+        if should_bump:
+            self._run_index += 1
+        run_index = int(self._run_index)
+
+        self.logger.narrate(f"Workspace: {self.workspace.source_path}")
+        self.logger.narrate(
+            f"Mode: {mode} (agent_model={self.config.agent_model}, tool_call_model={self.config.tool_call_model})"
+        )
+        self.logger.narrate(f"Run index: {run_index}")
+
+        if mode == "chat":
+            return self.Chat(user_command=user_command, run_index=run_index, openai_tools=openai_tools, workspace_info=workspace_info)
+
+        results, finished = self.ReAct(
+            user_command=user_command, run_index=run_index, openai_tools=openai_tools, workspace_info=workspace_info
+        )
+
+        if finished:
+            run_mem = [
+                e
+                for e in self._memory_for_run(run_index=run_index)
+                if isinstance(e, dict)
+                and e.get("mode") == "agent"
+                and "summary_of_run" not in e
+                and "summary_of_last_run" not in e
+            ]
+            summary_obj = self.llm_agent.summarize_run(system_prompt=SYSTEM_PROMPT, memory_entries=run_mem)
             self._accumulate_last_usage(self.llm_agent)
-            self._plan_text = str(plan_out.get("plan_text", "")).strip() or "(none)"
-        except Exception:
-            self._plan_text = "(none)"
-
-        self._emit("plan_text", text=self._plan_text)
-
-        try:
-            seed = self._update_memory(
-                user_command=user_command,
-                last_action_done=None,
-                observation_of_last_action=None,
-                tools=openai_tools,
-                workspace_info=workspace_info,
-            )
+            summary = str(summary_obj.get("summary", "")).strip() or "Finished."
             self._memory.append(
                 {
                     "t": self._now_iso(),
-                    "plan_text": self._plan_text,
-                    "last_action_done": None,
-                    "observation_of_last_action": None,
-                    "rationale": str(seed["rationale"]),
-                    "next_action": dict(seed["next_action"]),
+                    "run_index": int(run_index),
+                    "mode": "agent",
+                    "summary_of_run": summary,
                 }
             )
-
-            for step_index in range(1, int(self.config.max_steps) + 1):
-                current = self._memory[-1]
-                next_action = current.get("next_action", {})
-                if not isinstance(next_action, dict):
-                    raise RuntimeError("Missing next_action in memory.")
-
-                tool_name = str(next_action.get("tool", "")).strip()
-                tool_args = next_action.get("args", {})
-                if not isinstance(tool_args, dict):
-                    tool_args = {}
-                if tool_name not in known_tools:
-                    raise RuntimeError(f"Unknown tool requested: {tool_name!r}")
-
-                signature = self._call_signature(tool_name=tool_name, tool_args=tool_args)
-                flow = self._call_mcp_tool(
-                    tool_name=tool_name,
-                    tool_args=tool_args,
-                    step_index=step_index,
-                    signature=signature,
-                    results=results,
-                )
-
-                last_action_done: dict[str, Any] = {
-                    "tool": tool_name,
-                    "args": dict(tool_args),
-                    "status": "finished",
-                    "error": None,
-                }
-
-                observed_rois = self._resolve_linked_rois(next_action)
-                observation_of_last_action: Optional[Mapping[str, Any]] = None
-                if observed_rois:
-                    observation_of_last_action = self._observe(rois=observed_rois)
-
-                out = self._update_memory(
-                    user_command=user_command,
-                    last_action_done=last_action_done,
-                    observation_of_last_action=observation_of_last_action,
-                    tools=openai_tools,
-                    workspace_info=workspace_info,
-                )
-
-                entry = {
-                    "t": self._now_iso(),
-                    "last_action_done": last_action_done,
-                    "observation_of_last_action": observation_of_last_action,
-                    "rationale": str(out["rationale"]),
-                    "next_action": dict(out["next_action"]),
-                }
-                self._memory.append(entry)
-
-                narration = self.llm_agent.narrate_react_step(
-                    system_prompt=SYSTEM_PROMPT,
-                    last_action_done=last_action_done,
-                    observation_of_last_action=observation_of_last_action,
-                    rationale=str(out["rationale"]),
-                    next_action=dict(out["next_action"]),
-                )
-                self._accumulate_last_usage(self.llm_agent)
-
-                def _bad_narr(s: Any) -> bool:
-                    text = str(s or "").strip().lower()
-                    if not text:
-                        return True
-                    return any(
-                        p in text
-                        for p in [
-                            "i can't",
-                            "i cannot",
-                            "no tool access",
-                            "no access",
-                            "not available this turn",
-                            "unable to",
-                            "can't read",
-                            "cannot read",
-                            "can't observe",
-                            "cannot observe",
-                        ]
-                    )
-
-                def _fallback_observe_text(obs: Optional[Mapping[str, Any]]) -> str:
-                    if not isinstance(obs, dict):
-                        return "No linked ROIs observed."
-                    rois = obs.get("rois", [])
-                    results = obs.get("results", {})
-                    if not isinstance(rois, list) or not rois:
-                        return "No linked ROIs observed."
-                    parts = []
-                    if isinstance(results, dict):
-                        for r in rois:
-                            if not isinstance(r, str) or not r.strip():
-                                continue
-                            item = results.get(r, {})
-                            if isinstance(item, dict):
-                                val = item.get("value", None)
-                                if val is not None and str(val).strip():
-                                    parts.append(f"{r}={str(val).strip()}")
-                    return "Observed: " + (", ".join(parts) if parts else ", ".join(str(x) for x in rois))
-
-                if not isinstance(narration, dict) or any(
-                    _bad_narr(narration.get(k, "")) for k in ["action", "observe", "think", "next"]
-                ):
-                    narration = {
-                        "action": f"Executed {tool_name} with args={json.dumps(tool_args, ensure_ascii=False)} (status=finished).",
-                        "observe": _fallback_observe_text(observation_of_last_action),
-                        "think": str(out["rationale"]),
-                        "next": f"Next: {str(out['next_action'].get('tool','')).strip()} args={json.dumps(out['next_action'].get('args',{}), ensure_ascii=False)} linked_rois={out['next_action'].get('linked_rois', [])}",
-                    }
-
-                self._emit(
-                    "step_blocks",
-                    step=step_index,
-                    action=str(narration.get("action", "")).strip(),
-                    observe=str(narration.get("observe", "")).strip(),
-                    think=str(narration.get("think", "")).strip(),
-                    next=str(narration.get("next", "")).strip(),
-                    raw=entry,
-                )
-
-                self._last_action_log = f"{tool_name}({tool_args})"
-
-                if flow == "break":
-                    break
-                if str(out["next_action"].get("tool", "")).strip() == "finish":
-                    break
-
-        finally:
-            if self._abort is not None:
-                self._abort.stop()
+            self._emit("finish", say=summary)
 
         self.logger.narrate(f"Logs: {self.logger.run_root}")
         return results
 
-    def chat(self, *, first_message: str | None = None) -> None:
-        self.logger.narrate("Chat mode: type a command, or 'exit' to quit.")
+    def chat_cli(self, *, first_message: str | None = None) -> None:
+        self.logger.narrate("CLI chat: type a command, or 'exit' to quit.")
 
         def run_one(text: str) -> None:
             try:

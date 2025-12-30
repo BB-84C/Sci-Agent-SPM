@@ -8,6 +8,7 @@ import threading
 import shutil
 import subprocess
 import sys
+import signal
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -22,10 +23,13 @@ from textual.reactive import reactive
 from textual.screen import ModalScreen
 from textual.widgets import Footer, RichLog, Static, TextArea
 
+from rich.console import Group
+from rich.markdown import Markdown
 from rich.text import Text
 
 from .agent import VisualAutomationAgent
 from .session_store import list_sessions, load_session, save_session
+from .tui_settings import DEFAULT_SETTINGS_PATH, TuiSettings, load_tui_settings, save_tui_settings
 
 
 @dataclass(frozen=True, slots=True)
@@ -195,6 +199,7 @@ class ChatApp(App[None]):
         ("ctrl+l", "focus_transcript", "Log"),
         ("ctrl+i", "focus_input", "Input"),
         ("ctrl+shift+c", "copy_mode", "Select/Copy"),
+        ("ctrl+c", "abort", "Abort"),
         Binding("ctrl+s", "submit_input", "Send", show=True, priority=True),
         Binding("ctrl+enter", "submit_input", show=False, priority=True),
         Binding("ctrl+kp_enter", "submit_input", show=False, priority=True),
@@ -209,6 +214,7 @@ class ChatApp(App[None]):
         self._agent = agent
         self._first_message = first_message.strip() if first_message else None
         self._theme = Theme()
+        self._sigint_event = threading.Event()
         self._history_display: list[str] = []
         self._history_full: list[str] = []
         self._history_entries: list[dict[str, Any]] = []
@@ -225,12 +231,91 @@ class ChatApp(App[None]):
         self._session_log_roots: set[str] = set()
         self._cache_usage_inflight: bool = False
         self._cache_usage_text: str = ""
+        self._settings_path = DEFAULT_SETTINGS_PATH
+
+    def _persisted_settings_snapshot(self) -> TuiSettings:
+        cfg = self._agent.config
+        try:
+            ws_path = str(self._agent.workspace.source_path)
+        except Exception:
+            ws_path = None
+        return TuiSettings(
+            workspace=ws_path,
+            agent_model=str(getattr(cfg, "agent_model", "") or "").strip() or None,
+            tool_call_model=str(getattr(cfg, "tool_call_model", "") or "").strip() or None,
+            max_agent_steps=int(getattr(cfg, "max_steps", 0)) if int(getattr(cfg, "max_steps", 0)) > 0 else None,
+            action_delay_s=float(getattr(cfg, "action_delay_s", 0.0))
+            if float(getattr(cfg, "action_delay_s", 0.0)) >= 0
+            else None,
+            abort_hotkey=bool(getattr(cfg, "abort_hotkey", True)),
+            log_dir=str(getattr(cfg, "log_dir", "") or "").strip() or None,
+            memory_turns=int(getattr(cfg, "memory_turns", -1)),
+            mode=str(getattr(cfg, "run_mode", "") or "").strip() or None,
+        )
+
+    def _save_persisted_settings(self) -> None:
+        try:
+            save_tui_settings(self._persisted_settings_snapshot(), self._settings_path)
+        except Exception:
+            pass
+
+    def _load_persisted_settings(self) -> None:
+        try:
+            st = load_tui_settings(self._settings_path)
+        except Exception:
+            return
+        try:
+            if st.workspace:
+                self._agent.set_workspace(st.workspace)
+        except Exception:
+            pass
+        try:
+            if st.agent_model:
+                self._agent.set_agent_model(st.agent_model)
+        except Exception:
+            pass
+        try:
+            if st.tool_call_model:
+                self._agent.set_tool_call_model(st.tool_call_model)
+        except Exception:
+            pass
+        try:
+            if st.max_agent_steps is not None:
+                self._agent.set_max_steps(int(st.max_agent_steps))
+        except Exception:
+            pass
+        try:
+            if st.action_delay_s is not None:
+                self._agent.set_action_delay_s(float(st.action_delay_s))
+        except Exception:
+            pass
+        try:
+            if st.abort_hotkey is not None:
+                self._agent.set_abort_hotkey(bool(st.abort_hotkey))
+        except Exception:
+            pass
+        try:
+            if st.log_dir:
+                self._agent.set_log_dir(st.log_dir)
+        except Exception:
+            pass
+        try:
+            if st.memory_turns is not None:
+                self._agent.set_memory_turns(int(st.memory_turns))
+        except Exception:
+            pass
+        try:
+            if st.mode:
+                self._agent.set_run_mode(st.mode)
+        except Exception:
+            pass
 
     def on_unmount(self) -> None:
         if not self._current_session_saved:
             self._delete_log_roots(self._session_log_roots)
         # Keep `.temp_session.json` on disk for crash recovery / post-run inspection.
         # The temp session is cleared explicitly when the user starts a new session.
+        self._save_persisted_settings()
 
     def _clear_temp_session(self) -> None:
         try:
@@ -433,22 +518,10 @@ class ChatApp(App[None]):
         # Override TextArea defaults so selection/copy works like a normal editor.
         BINDINGS = [
             Binding("ctrl+a", "select_all", "Select all", show=True, priority=True),
-            Binding("ctrl+c", "copy", "Copy", show=True, priority=True),
         ]
 
     class Transcript(RichLog):
-        BINDINGS = [
-            Binding("ctrl+c", "copy_transcript", "Copy transcript", show=False, priority=True),
-        ]
-
-        def action_copy_transcript(self) -> None:
-            app = getattr(self, "app", None)
-            if app is None:
-                return
-            try:
-                app.copy_to_clipboard(getattr(app, "_get_transcript_plain_text")())
-            except Exception:
-                pass
+        pass
 
     class TranscriptCopyScreen(ModalScreen[None]):
         CSS = """
@@ -525,10 +598,22 @@ class ChatApp(App[None]):
             yield Footer()
 
     def on_mount(self) -> None:
+        self._load_persisted_settings()
+        try:
+            signal.signal(signal.SIGINT, lambda _sig, _frame: self._sigint_event.set())
+        except Exception:
+            pass
+        try:
+            self.set_interval(0.1, self._poll_sigint)
+        except Exception:
+            pass
         self._set_status("Ready")
         self._append_system(f"Workspace: {self._agent.workspace.source_path}")
         self._append_system("Enter: send • Shift+Enter: newline • /help for commands")
-        self._append_system("Safety: ESC abort hotkey • Mouse to top-left FAILSAFE")
+        if self._agent.config.abort_hotkey:
+            self._append_system("Safety: Ctrl+C abort hotkey • Mouse to top-left FAILSAFE")
+        else:
+            self._append_system("Safety: Mouse to top-left FAILSAFE (abort hotkey disabled)")
         self._sync_tokens_from_agent()
         self._track_log_root(self._current_log_root())
         self._request_cache_usage_update()
@@ -537,6 +622,12 @@ class ChatApp(App[None]):
         self._resize_input_to_content()
         if self._first_message:
             self.call_later(lambda: self._send(self._first_message or ""))
+
+    def _poll_sigint(self) -> None:
+        if not self._sigint_event.is_set():
+            return
+        self._sigint_event.clear()
+        self.action_abort()
 
     def _set_status(self, text: str) -> None:
         self.query_one("#status", Static).update(text)
@@ -864,10 +955,40 @@ class ChatApp(App[None]):
             transcript.write(self._render_entry(entry))
             transcript.write(Text(""))
 
-    def _render_entry(self, entry: TranscriptEntry) -> Text:
+    def _render_entry(self, entry: TranscriptEntry) -> object:
         t = self._theme
         tag = entry.tag.strip().upper()
         content = entry.content or ""
+        content_md = content.replace("\u200B", "")
+
+        def looks_like_markdown(s: str) -> bool:
+            s = (s or "").strip()
+            if not s:
+                return False
+            if "```" in s:
+                return True
+            if re.search(r"(?m)^\\s{0,3}[-*+]\\s+\\S", s):
+                return True
+            if re.search(r"(?m)^#{1,6}\\s+\\S", s):
+                return True
+            if re.search(r"\\*\\*[^*]+\\*\\*", s):
+                return True
+            if re.search(r"\\[[^\\]]+\\]\\([^)]+\\)", s):
+                return True
+            return False
+
+        def split_ts_prefix(s: str) -> tuple[str, str]:
+            raw = s or ""
+            m = re.match(r"^(\\d\\d:\\d\\d:\\d\\d)([\\s\\n].*)$", raw)
+            if not m:
+                return ("", raw)
+            ts = m.group(1)
+            rest = (m.group(2) or "")
+            if rest.startswith(" "):
+                rest = rest[1:]
+            if rest.startswith("\n"):
+                rest = rest[1:]
+            return (ts, rest)
 
         def append_multiline(out: Text, s: str, *, style: str) -> None:
             # In Rich, styles do not reliably carry across newline boundaries when
@@ -886,6 +1007,13 @@ class ChatApp(App[None]):
 
         if tag == "YOU":
             msg_bg = t.mix(t.user, 0.10)
+            if looks_like_markdown(content_md):
+                ts, body = split_ts_prefix(content_md)
+                header = Text()
+                header.append_text(chip("YOU", t.user))
+                if ts:
+                    header.append(f" {ts}", style=f"{t.user} on {msg_bg}")
+                return Group(header, Markdown(body, style=f"{t.user} on {msg_bg}"), Text(""))
             msg = Text()
             msg.append_text(chip("YOU", t.user))
             msg.append(" ")
@@ -894,6 +1022,13 @@ class ChatApp(App[None]):
 
         if tag == "AGENT":
             msg_bg = t.mix(t.agent, 0.10)
+            if looks_like_markdown(content_md):
+                ts, body = split_ts_prefix(content_md)
+                header = Text()
+                header.append_text(chip("AGENT", t.agent))
+                if ts:
+                    header.append(f" {ts}", style=f"{t.fg} on {msg_bg}")
+                return Group(header, Markdown(body, style=f"{t.fg} on {msg_bg}"), Text(""))
             msg = Text()
             msg.append_text(chip("AGENT", t.agent))
             msg.append(" ")
@@ -902,6 +1037,13 @@ class ChatApp(App[None]):
 
         if tag == "SYSTEM":
             msg_bg = t.mix(t.dim, 0.08)
+            if looks_like_markdown(content_md):
+                ts, body = split_ts_prefix(content_md)
+                header = Text()
+                header.append_text(chip("SYSTEM", t.dim))
+                if ts:
+                    header.append(f" {ts}", style=f"{t.dim} on {msg_bg}")
+                return Group(header, Markdown(body, style=f"{t.dim} on {msg_bg}"), Text(""))
             msg = Text()
             msg.append_text(chip("SYSTEM", t.dim))
             msg.append(" ")
@@ -910,6 +1052,13 @@ class ChatApp(App[None]):
 
         if tag == "ERROR":
             msg_bg = t.mix(t.error, 0.08)
+            if looks_like_markdown(content_md):
+                ts, body = split_ts_prefix(content_md)
+                header = Text()
+                header.append_text(chip("ERROR", t.error))
+                if ts:
+                    header.append(f" {ts}", style=f"{t.error} on {msg_bg}")
+                return Group(header, Markdown(body, style=f"{t.error} on {msg_bg}"), Text(""))
             msg = Text()
             msg.append_text(chip("ERROR", t.error))
             msg.append(" ")
@@ -942,6 +1091,13 @@ class ChatApp(App[None]):
         if tag in block_styles:
             label, color = block_styles[tag]
             body_bg = t.mix(color, 0.08)
+            if tag not in {"TOOL CALL", "TOOL RESULT"} and looks_like_markdown(content_md):
+                ts, body = split_ts_prefix(content_md)
+                header = Text()
+                header.append_text(box_title(label, color))
+                if ts:
+                    header.append(f"\n{ts}", style=f"{t.fg} on {body_bg}")
+                return Group(header, Markdown(body, style=f"{t.fg} on {body_bg}"), Text(""))
             out = Text()
             out.append_text(box_title(label, color))
             out.append("\n")
@@ -949,6 +1105,8 @@ class ChatApp(App[None]):
             return out
 
         # Fallback: show untagged lines without extra styling.
+        if looks_like_markdown(content_md):
+            return Markdown(content_md, style=t.fg)
         return Text(content, style=t.fg)
 
     def _rerender_transcript_from_history(self) -> None:
@@ -974,6 +1132,23 @@ class ChatApp(App[None]):
 
     def action_copy_mode(self) -> None:
         self.push_screen(self.TranscriptCopyScreen(text=self._get_transcript_plain_text()))
+
+    def action_abort(self) -> None:
+        if not self.busy:
+            return
+        if not self._agent.config.abort_hotkey:
+            self._append_error("Abort hotkey disabled. Use /abort_hotkey on to enable.")
+            return
+        try:
+            if getattr(getattr(self._agent, "_abort", None), "event", None) is not None and self._agent._abort.event.is_set():  # type: ignore[attr-defined]
+                return
+        except Exception:
+            pass
+        self._append_block("Abort", "Abort requested (Ctrl+C). Waiting for the current step to stop…")
+        try:
+            self._agent.request_abort()
+        except Exception:
+            pass
 
     def action_scroll_up(self) -> None:
         self._transcript().scroll_up()
@@ -1013,6 +1188,8 @@ class ChatApp(App[None]):
                         "/agent_model [name]",
                         "/tool_call_model [name]",
                         "/max_agent_steps [int]",
+                        "/mode",
+                        "/mode agent|chat|auto",
                         "/memory_turn",
                         "/set_memory_turn [-1|N]",
                         "/calibration_tool",
@@ -1057,7 +1234,20 @@ class ChatApp(App[None]):
                 return True
             try:
                 self._agent.set_workspace(rest)
+                self._save_persisted_settings()
                 self._append_block("Workspace", f"Workspace set to: {self._agent.workspace.source_path}")
+            except Exception as e:
+                self._append_error(str(e))
+            return True
+
+        if cmd == "/mode":
+            if not rest:
+                self._append_block("Mode", f"Current mode: {self._agent.config.run_mode}")
+                return True
+            try:
+                self._agent.set_run_mode(rest)
+                self._save_persisted_settings()
+                self._append_block("Mode", f"Mode set to: {self._agent.config.run_mode}")
             except Exception as e:
                 self._append_error(str(e))
             return True
@@ -1072,6 +1262,7 @@ class ChatApp(App[None]):
                 return True
             try:
                 self._agent.set_memory_turns(int(rest.strip()))
+                self._save_persisted_settings()
                 self._append_block("Memory Turn", f"memory_turns set to: {self._agent.config.memory_turns}")
             except Exception as e:
                 self._append_error(str(e))
@@ -1100,6 +1291,7 @@ class ChatApp(App[None]):
                 return True
             try:
                 self._agent.set_agent_model(rest)
+                self._save_persisted_settings()
                 self._append_block("Agent Model", f"Agent model set to: {self._agent.config.agent_model}")
             except Exception as e:
                 self._append_error(str(e))
@@ -1111,6 +1303,7 @@ class ChatApp(App[None]):
                 return True
             try:
                 self._agent.set_tool_call_model(rest)
+                self._save_persisted_settings()
                 self._append_block("Tool Call Model", f"Tool-call model set to: {self._agent.config.tool_call_model}")
             except Exception as e:
                 self._append_error(str(e))
@@ -1122,6 +1315,7 @@ class ChatApp(App[None]):
                 return True
             try:
                 self._agent.set_max_steps(int(rest))
+                self._save_persisted_settings()
                 self._append_block("Max Agent Steps", f"Max agent steps set to: {self._agent.config.max_steps}")
             except Exception as e:
                 self._append_error(str(e))
@@ -1133,6 +1327,7 @@ class ChatApp(App[None]):
                 return True
             try:
                 self._agent.set_action_delay_s(float(rest))
+                self._save_persisted_settings()
                 self._append_block("Action Delay", f"Action delay set to: {self._agent.config.action_delay_s:g} seconds")
             except Exception as e:
                 self._append_error(str(e))
@@ -1151,6 +1346,7 @@ class ChatApp(App[None]):
                 return True
             try:
                 self._agent.set_abort_hotkey(val in truthy)
+                self._save_persisted_settings()
                 status = "ON" if self._agent.config.abort_hotkey else "OFF"
                 self._append_block("Abort Hotkey", f"The abort hotkey status is set to be: {status}.")
             except Exception as e:
@@ -1163,6 +1359,7 @@ class ChatApp(App[None]):
                 return True
             try:
                 self._agent.set_log_dir(rest)
+                self._save_persisted_settings()
                 self._append_block("Log Dir", f"Log dir set to: {self._agent.config.log_dir}")
                 self._request_cache_usage_update()
             except Exception as e:
@@ -1367,6 +1564,8 @@ class ChatApp(App[None]):
         def run_bg() -> None:
             try:
                 self._agent.run(user_command=text)
+            except KeyboardInterrupt:
+                self.post_message(AgentEvent({"type": "aborted"}))
             except Exception as e:
                 self.post_message(AgentEvent({"type": "error", "text": str(e)}))
             finally:
@@ -1398,6 +1597,9 @@ class ChatApp(App[None]):
             self.busy = False
             self._set_status("Ready")
             self.action_focus_input()
+            return
+        if t == "aborted":
+            self._append_block("Aborted", "Stopped.")
             return
         if t == "plan":
             plan = ev.get("plan", None)
@@ -1457,6 +1659,12 @@ class ChatApp(App[None]):
         if t == "finish":
             self._append_block("Done", str(ev.get("say", "Finished.")))
             self._rerender_transcript_from_history()
+            return
+        if t == "chat":
+            txt = str(ev.get("text", "") or "").strip()
+            if txt:
+                self._append_agent(txt)
+                self._rerender_transcript_from_history()
             return
 
 

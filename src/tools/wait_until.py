@@ -15,6 +15,19 @@ _DEFAULT_MAX_TOTAL_SECONDS = 6 * 60 * 60
 _SLEEP_CAP_SECONDS = 6 * 60 * 60
 _FIRST_SLEEP_BUFFER_SECONDS = 10.0
 _MAX_FIRST_SLEEP_SECONDS = 10 * 60.0
+_ABORT_POLL_SECONDS = 0.1
+
+
+def _sleep_with_abort(agent: "VisualAutomationAgent", seconds: float) -> None:
+    remaining = float(seconds)
+    if remaining <= 0:
+        return
+    while remaining > 0:
+        if getattr(agent, "_abort", None) is not None and agent._abort.event.is_set():  # type: ignore[attr-defined]
+            raise KeyboardInterrupt()
+        chunk = min(float(_ABORT_POLL_SECONDS), remaining)
+        time.sleep(chunk)
+        remaining -= chunk
 
 
 def _coerce_roi_names(action_input: Mapping[str, Any]) -> list[str]:
@@ -199,6 +212,8 @@ def handle(
     results: list[Mapping[str, Any]],
 ) -> Literal["continue", "break"]:
     agent._consecutive_observes = 0
+    if getattr(agent, "_abort", None) is not None and agent._abort.event.is_set():  # type: ignore[attr-defined]
+        raise KeyboardInterrupt()
 
     roi_names = _coerce_roi_names(action_input)
     seconds = _require_nonneg_seconds(action_input, "seconds")
@@ -251,6 +266,8 @@ def handle(
 
     llm_error = ""
     try:
+        if getattr(agent, "_abort", None) is not None and agent._abort.event.is_set():  # type: ignore[attr-defined]
+            raise KeyboardInterrupt()
         choice = _llm_choose_sleep(
             agent,
             roi_names=roi_names,
@@ -294,7 +311,7 @@ def handle(
         agent.logger.narrate(
             f"[WaitUntil] Sleeping once for {sleep_s:.1f}s (hint={sleep_hint:.1f}s + buffer={_FIRST_SLEEP_BUFFER_SECONDS:.0f}s)."
         )
-        time.sleep(float(sleep_s))
+        _sleep_with_abort(agent, float(sleep_s))
 
     result: dict[str, Any] = {
         "rois": roi_names,

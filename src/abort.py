@@ -21,10 +21,14 @@ class AbortHandle:
 def start_abort_hotkey(*, key: str = "esc") -> AbortHandle:
     event = Event()
 
+    k = str(key or "").strip().lower()
+    if k in {"none", "off", "disabled", "disable"}:
+        return AbortHandle(event=event, _listener=None)
+
     try:
         from pynput import keyboard
 
-        target = keyboard.Key.esc if key.lower() == "esc" else None
+        target = keyboard.Key.esc if k == "esc" else None
 
         def on_press(k: object) -> None:
             if target is not None and k == target:
@@ -36,4 +40,3 @@ def start_abort_hotkey(*, key: str = "esc") -> AbortHandle:
         return AbortHandle(event=event, _listener=listener)
     except Exception:
         return AbortHandle(event=event, _listener=None)
-

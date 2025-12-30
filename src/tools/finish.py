@@ -19,5 +19,5 @@ def handle(
     agent._last_action_signature = None
     agent._observed_since_last_action = True
     results.append({"action": "finish", "action_input": dict(action_input), "say": say})
-    agent._emit("finish", step=step_index, say=say)
+    # Do not emit a user-facing DONE block here; the agent orchestrator emits a run summary at the end.
     return "break"

@@ -421,3 +421,129 @@ class OpenAiMultimodalClient:
         text = getattr(resp, "output_text", None) or ""
         return _extract_json_object(text)
 
+    def classify_run_mode(
+        self,
+        *,
+        system_prompt: str,
+        user_message: str,
+    ) -> Mapping[str, Any]:
+        """
+        Classify whether a user message should run in ReAct agent mode or chat mode.
+
+        Returns JSON:
+          { "mode": "agent"|"chat", "reason": "<short>" }
+        """
+        system = (
+            f"{system_prompt}\n\n"
+            "MODE CLASSIFIER:\n"
+            "- Decide whether the user is asking to PERFORM an on-desktop task (agent) or asking a question / discussion (chat).\n"
+            "- Return ONLY one JSON object.\n"
+            '- JSON keys: "mode" (required; "agent" or "chat"), "reason" (required; short).\n'
+            "- If the user asks to click/type/scan/wait/change values in the app, choose agent.\n"
+            "- If the user asks to explain, analyze logs, or discuss behavior, choose chat.\n"
+        )
+        full_user = f"USER MESSAGE:\n{user_message}\n\nReturn ONLY valid JSON."
+        resp = self._client.responses.create(
+            model=self._config.model,
+            input=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": [{"type": "input_text", "text": full_user}]},
+            ],
+            tool_choice="none",
+            max_output_tokens=120,
+            timeout=self._config.timeout_s,
+        )
+        self._set_last_usage(resp)
+        text = getattr(resp, "output_text", None) or ""
+        return _extract_json_object(text)
+
+    def chat_reply(
+        self,
+        *,
+        system_prompt: str,
+        user_message: str,
+        memory_entries: list[Mapping[str, Any]],
+        workspace_info: Mapping[str, Any],
+        tools_text: str,
+    ) -> Mapping[str, Any]:
+        """
+        Chat-only mode: respond with text; do not call tools.
+
+        Returns JSON:
+          { "reply": "<assistant text>" }
+        """
+        system = (
+            f"{system_prompt}\n\n"
+            "CHAT MODE:\n"
+            "- You are chatting with the user. Do NOT call tools.\n"
+            "- You may reference WORKSPACE and TOOLS to explain what the agent can do, but you cannot execute actions.\n"
+            "- Return ONLY one JSON object.\n"
+            '- JSON key: "reply" (required string).\n'
+        )
+        try:
+            mem_json = json.dumps(list(memory_entries), ensure_ascii=False, default=str)
+        except Exception:
+            mem_json = "[]"
+        try:
+            ws_json = json.dumps(dict(workspace_info), ensure_ascii=False, default=str)
+        except Exception:
+            ws_json = "{}"
+        full_user = (
+            f"MEMORY (structured):\n{mem_json}\n\n"
+            f"WORKSPACE (summary):\n{ws_json}\n\n"
+            f"TOOLS (schemas):\n{tools_text}\n\n"
+            f"USER MESSAGE:\n{user_message}\n\n"
+            "Return ONLY valid JSON."
+        )
+        resp = self._client.responses.create(
+            model=self._config.model,
+            input=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": [{"type": "input_text", "text": full_user}]},
+            ],
+            tool_choice="none",
+            timeout=self._config.timeout_s,
+        )
+        self._set_last_usage(resp)
+        text = getattr(resp, "output_text", None) or ""
+        return _extract_json_object(text)
+
+    def summarize_run(
+        self,
+        *,
+        system_prompt: str,
+        memory_entries: list[Mapping[str, Any]],
+    ) -> Mapping[str, Any]:
+        """
+        Summarize one run's memory entries.
+
+        Returns JSON:
+          { "summary": "<short>" }
+        """
+        system = (
+            f"{system_prompt}\n\n"
+            "RUN SUMMARY MODE:\n"
+            "- Summarize the run based ONLY on the provided structured memory entries.\n"
+            "- Return ONLY one JSON object.\n"
+            '- JSON key: "summary" (required string).\n'
+            "- Keep it concise and actionable (what was done, key observations, where it ended).\n"
+        )
+        try:
+            mem_json = json.dumps(list(memory_entries), ensure_ascii=False, default=str)
+        except Exception:
+            mem_json = "[]"
+        full_user = f"RUN MEMORY (structured):\n{mem_json}\n\nReturn ONLY valid JSON."
+        resp = self._client.responses.create(
+            model=self._config.model,
+            input=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": [{"type": "input_text", "text": full_user}]},
+            ],
+            tool_choice="none",
+            max_output_tokens=250,
+            timeout=self._config.timeout_s,
+        )
+        self._set_last_usage(resp)
+        text = getattr(resp, "output_text", None) or ""
+        return _extract_json_object(text)
+
