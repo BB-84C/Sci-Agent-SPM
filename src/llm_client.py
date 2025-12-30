@@ -149,14 +149,21 @@ class OpenAiMultimodalClient:
             '"unreadable": ["<roi_name>"] }\n'
             "Rules:\n"
             "- Use the ROI description as authoritative for semantics (e.g., discrete tokens like <scanning>/<idle>).\n"
-            "- If an ROI is unreadable, set value to null and include it in unreadable.\n"
+            "- First, look at the image and state what you see; then map that to the value.\n"
+            "- notes MUST start with a brief literal visual description beginning with \"I see ...\".\n"
+            "  Then add \"Meaning: ...\" to explain how that maps to the chosen value.\n"
+            "- If an ROI is unreadable, set value to null and include the ROI name in unreadable.\n"
             "- confidence should be between 0 and 1 when possible.\n"
             "- No markdown. No code fences. No extra text."
         )
         lines = []
         for n, d, _img in roi_items:
             lines.append(f"- {n}: {d or '(none)'}")
-        user = "Observe and extract the current value(s) from these ROI images.\n\nROIs:\n" + ("\n".join(lines) if lines else "(none)")
+        user = (
+            "Based on each ROI description and its image, what do you see?\n"
+            "Then extract the current value(s) for each ROI.\n\n"
+            "ROIs:\n" + ("\n".join(lines) if lines else "(none)")
+        )
 
         content: list[dict[str, Any]] = [{"type": "input_text", "text": user}]
         for roi_name, _desc, img in roi_items:

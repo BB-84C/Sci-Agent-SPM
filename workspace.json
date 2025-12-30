@@ -18,7 +18,7 @@
       "y": 51,
       "w": 63,
       "h": 56,
-      "description": "ROI covering scan status. It only tells the current status of scanning: <scanning>, <paused>, and <idle>, if you need to get how long the scanning will take, refer to the scan time countdown ROI. It's an icon made of 2 black bars. If the Icon is in black, then it means the scanning is in progress, return <scanning>. If the icon is in black and has a square gray shadow background, then it means the scanning is on paused, return: <paused>. If the icon is in faded gray color, it means there's no scanning in progress, return <idle>.",
+      "description": "ROI covering scan status. It only tells the current status of scanning: <scanning>, <paused>, and <idle>, if you need to get how long the scanning will take, refer to the scan time countdown ROI. It's an icon made of 2 black bars. If the Icon is in black, then it means the scanning is in progress, return <scanning>. If the icon is in black and has a square gray shadow background, then it means the scanning is on paused, return: <paused>. If the icon is in faded gray color, it means there's no scanning in progress, return <idle>. Note that sometimes the LLM will fail distinguishing image to be <paused> or <idle>, it is not uncommom. So if you see the scanning countdown is already zero, and the scanning status is identified as <paused>, it's actually in <idle>. ",
       "tags": [
         "status",
         "scan"
