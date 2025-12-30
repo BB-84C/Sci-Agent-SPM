@@ -2,10 +2,10 @@
   "rois": [
     {
       "name": "bias_readout",
-      "x": 11,
-      "y": 212,
-      "w": 721,
-      "h": 150,
+      "x": 554,
+      "y": 292,
+      "w": 169,
+      "h": 50,
       "description": "ROI covering the displayed bias value (V) in Nanonis.",
       "tags": [
         "readout",
@@ -26,10 +26,10 @@
     },
     {
       "name": "set_current_readout",
-      "x": 18,
-      "y": 759,
-      "w": 123,
-      "h": 92,
+      "x": 25,
+      "y": 810,
+      "w": 110,
+      "h": 33,
       "description": "ROI covering the displayed set current value (A) in Nanonis. It does not always equal to the real current. Since this set current is only used in the constant-current-scanning mode to set the current that STM tries to maintain. But the actual real current depends on the tip's microscopical geometry and the electronic status. ",
       "tags": [
         "readout",

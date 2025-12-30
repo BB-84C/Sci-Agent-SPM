@@ -42,16 +42,25 @@ def create_mcp_server(*, agent: Any) -> FastMCP:
 
     @mcp_tool(
         name="wait_until",
-        description="Wait for a UI condition by repeatedly checking one or more ROI screenshots.",
+        description=(
+            "Wait for a UI condition by repeatedly checking one or more ROI screenshots.\n\n"
+            "Required input: wait_logic (JSON string).\n"
+            "- Must include key: action_to_wait (string)\n"
+            "- Must include key: reason (string)\n"
+            
+            "- Optional keys (if helpful): done_when, not_done_when\n"
+            "Example:\n"
+            '  {"action_to_wait":"start_scan|set_motion","reason":"wait for current scan to finish before changing settings","done_when":"scan_status == <idle>","not_done_when":["scan_status == <paused>","scan_status == <scanning>"]}\n'
+        ),
         meta={"category": "wait"},
     )
     def wait_until(
         seconds: float,
+        wait_logic: str,
         roi: Optional[str] = None,
         rois: Optional[list[str]] = None,
         max_rounds: int = 10,
         max_total_seconds: int = 6 * 60 * 60,
-        reason: Optional[str] = None,
     ) -> Literal["continue", "break"]:
         ctx = _ctx()
         if rois is None and (roi is None or not str(roi).strip()):
@@ -60,13 +69,12 @@ def create_mcp_server(*, agent: Any) -> FastMCP:
             "seconds": seconds,
             "max_rounds": max_rounds,
             "max_total_seconds": max_total_seconds,
+            "wait_logic": wait_logic,
         }
         if rois is not None:
             action_input["rois"] = rois
         else:
             action_input["roi"] = str(roi or "").strip()
-        if reason is not None:
-            action_input["reason"] = reason
         return tool_wait_until(
             agent,
             step_index=ctx.step_index,
