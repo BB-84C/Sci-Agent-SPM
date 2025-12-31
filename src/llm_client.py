@@ -707,6 +707,18 @@ class OpenAiMultimodalClient:
                 has_non_summary = True
                 break
             if not has_non_summary:
+                # Preserve already-compressed runs in memory as-is (no modification),
+                # while still avoiding re-archiving the same entries.
+                compressed.extend(entries)
+                for e in entries:
+                    v = e.get("summary_of_run", None)
+                    if isinstance(v, str) and v.strip():
+                        summaries[str(int(run_index))] = v.strip()
+                        break
+                    v = e.get("summary_of_last_run", None)
+                    if isinstance(v, str) and v.strip():
+                        summaries[str(int(run_index))] = v.strip()
+                        break
                 continue
 
             existing_summary: str | None = None
