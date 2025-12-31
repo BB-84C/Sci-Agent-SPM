@@ -34,8 +34,18 @@ function Ensure-Venv([string]$repoRoot) {
 }
 
 function Ensure-Dependencies([string]$venvPy, [string]$repoRoot) {
-    $check = & $venvPy -c "import mss, pyautogui, PIL, pynput, openai, textual" 2>$null
-    if ($LASTEXITCODE -eq 0) {
+    # In some PowerShell versions/configs, non-zero exit codes from native commands can be treated as terminating
+    # errors when $ErrorActionPreference="Stop". We want missing deps to fall through to pip install.
+    $depsOk = $false
+    try {
+        & $venvPy -c "import mss, pyautogui, PIL, pynput, textual; from google import genai" *> $null
+        if ($LASTEXITCODE -eq 0) { $depsOk = $true }
+    }
+    catch {
+        $depsOk = $false
+    }
+
+    if ($depsOk) {
         return
     }
 
@@ -62,8 +72,8 @@ function Ensure-Workspace([string]$repoRoot) {
     throw "workspace.json missing. Create one via: python -m src.calibrate_gui --workspace workspace.json"
 }
 
-function Ensure-OpenAiKey([string]$repoRoot) {
-    if ($env:OPENAI_API -or $env:OPENAI_API_KEY) {
+function Ensure-GeminiKey([string]$repoRoot) {
+    if ($env:GEMINI_API_KEY -or $env:GOOGLE_API_KEY) {
         return
     }
 
@@ -72,26 +82,26 @@ function Ensure-OpenAiKey([string]$repoRoot) {
         foreach ($line in Get-Content -LiteralPath $envFile) {
             $t = ([string]$line).Trim()
             if (-not $t -or $t.StartsWith("#")) { continue }
-            if ($t -match "^\s*OPENAI_API\s*=\s*(.+)\s*$") {
-                $env:OPENAI_API = $Matches[1].Trim().Trim('"').Trim("'")
+            if ($t -match "^\s*GEMINI_API_KEY\s*=\s*(.+)\s*$") {
+                $env:GEMINI_API_KEY = $Matches[1].Trim().Trim('"').Trim("'")
                 break
             }
-            if ($t -match "^\s*OPENAI_API_KEY\s*=\s*(.+)\s*$") {
-                $env:OPENAI_API_KEY = $Matches[1].Trim().Trim('"').Trim("'")
+            if ($t -match "^\s*GOOGLE_API_KEY\s*=\s*(.+)\s*$") {
+                $env:GOOGLE_API_KEY = $Matches[1].Trim().Trim('"').Trim("'")
                 break
             }
         }
-        if ($env:OPENAI_API -or $env:OPENAI_API_KEY) {
+        if ($env:GEMINI_API_KEY -or $env:GOOGLE_API_KEY) {
             return
         }
     }
 
-    Write-Host "OpenAI API key not found (env OPENAI_API / OPENAI_API_KEY)."
-    $key = Read-Host "Paste your OpenAI key for this session (won't be saved)"
+    Write-Host "Gemini API key not found (env GEMINI_API_KEY / GOOGLE_API_KEY)."
+    $key = Read-Host "Paste your Gemini key for this session (won't be saved)"
     if (-not $key) {
-        throw "Missing OpenAI API key."
+        throw "Missing Gemini API key."
     }
-    $env:OPENAI_API = $key
+    $env:GEMINI_API_KEY = $key
 }
 
 $repoRoot = Resolve-RepoRoot
@@ -101,6 +111,6 @@ Ensure-Python
 $venvPy = Ensure-Venv -repoRoot $repoRoot
 Ensure-Dependencies -venvPy $venvPy -repoRoot $repoRoot
 Ensure-Workspace -repoRoot $repoRoot
-Ensure-OpenAiKey -repoRoot $repoRoot
+Ensure-GeminiKey -repoRoot $repoRoot
 
 & $venvPy -m src.main --agent

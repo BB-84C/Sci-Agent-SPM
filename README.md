@@ -46,7 +46,7 @@ It will:
 - create `.venv` if needed
 - install dependencies from `requirements.txt`
 - create `workspace.json` from `workspace.example.json` (if missing)
-- prompt for `OPENAI_API` (if missing) and start the TUI
+- prompt for `GEMINI_API_KEY` (if missing) and start the TUI
 
 Optional: install a user-level `Sci-Agent-SPM` command (copies a shim to `~\.local\bin` and adds it to your user `PATH`):
 
@@ -61,7 +61,7 @@ Optional: install a user-level `Sci-Agent-SPM` command (copies a shim to `~\.loc
 - Windows 10/11
 - Python 3.11+ on PATH
 - Your own SPM controlling software, (eg: Nanonis SPM Control Software) running on a stable monitor layout
-- An OpenAI API key (`OPENAI_API` or `OPENAI_API_KEY`)
+- A Gemini API key (`GEMINI_API_KEY` or `GOOGLE_API_KEY`)
 
 ### 1) Create a venv + install deps
 
@@ -101,13 +101,13 @@ Option B: edit JSON directly:
    - `anchors`: click targets (input boxes, buttons)
    - `linked_ROIs` (anchor only): ROIs to observe after that action for verification
 
-### 3) Set your OpenAI key
+### 3) Set your Gemini key
 
 ```powershell
-$env:OPENAI_API = "YOUR_KEY_HERE"
+$env:GEMINI_API_KEY = "YOUR_KEY_HERE"
 ```
 
-The bootstrap script also loads `OPENAI_API` / `OPENAI_API_KEY` from a local `.env` file if present.
+The bootstrap script also loads `GEMINI_API_KEY` / `GOOGLE_API_KEY` from a local `.env` file if present.
 
 ## Run
 

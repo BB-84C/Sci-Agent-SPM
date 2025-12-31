@@ -2,6 +2,6 @@ mss
 pyautogui
 pillow
 pynput
-openai
+google-genai
 textual
 mcp

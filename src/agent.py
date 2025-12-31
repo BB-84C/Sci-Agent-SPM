@@ -11,7 +11,7 @@ from mcp.shared.memory import create_connected_server_and_client_session
 from .actions import ActionConfig, Actor
 from .abort import start_abort_hotkey
 from .capture import ScreenCapturer
-from .llm_client import LlmConfig, OpenAiMultimodalClient, estimate_tokens
+from .llm_client import GeminiMultimodalClient, LlmConfig, estimate_tokens
 from .logger import RunLogger
 from .mcp_server import McpToolContext, create_mcp_server
 from .workspace import Workspace, load_workspace
@@ -31,8 +31,8 @@ Keep any narration short (1-2 sentences). Do not reveal hidden chain-of-thought.
 
 @dataclass(frozen=True, slots=True)
 class AgentConfig:
-    agent_model: str = "gpt-5.2"
-    tool_call_model: str = "gpt-5-nano"
+    agent_model: str = "gemini-1.5-pro"
+    tool_call_model: str = "gemini-1.5-flash"
     max_steps: int = 50
     action_delay_s: float = 0.25
     log_dir: str = "logs"
@@ -69,8 +69,8 @@ class VisualAutomationAgent:
             abort_event=abort.event if abort else None,
         )
 
-        self.llm_agent = OpenAiMultimodalClient(LlmConfig(model=config.agent_model))
-        self.llm_tool = OpenAiMultimodalClient(LlmConfig(model=config.tool_call_model))
+        self.llm_agent = GeminiMultimodalClient(LlmConfig(model=config.agent_model))
+        self.llm_tool = GeminiMultimodalClient(LlmConfig(model=config.tool_call_model))
         # Back-compat alias used by some tool implementations.
         self.llm = self.llm_agent
 
@@ -127,7 +127,7 @@ class VisualAutomationAgent:
         if not model:
             raise ValueError("Agent model name cannot be empty.")
         self.config = replace(self.config, agent_model=model)
-        self.llm_agent = OpenAiMultimodalClient(LlmConfig(model=model))
+        self.llm_agent = GeminiMultimodalClient(LlmConfig(model=model))
         self.llm = self.llm_agent
 
     def set_tool_call_model(self, model: str) -> None:
@@ -135,7 +135,7 @@ class VisualAutomationAgent:
         if not model:
             raise ValueError("Tool-call model name cannot be empty.")
         self.config = replace(self.config, tool_call_model=model)
-        self.llm_tool = OpenAiMultimodalClient(LlmConfig(model=model))
+        self.llm_tool = GeminiMultimodalClient(LlmConfig(model=model))
 
     def set_max_steps(self, max_steps: int) -> None:
         max_steps = int(max_steps)
@@ -253,7 +253,7 @@ class VisualAutomationAgent:
             total_tokens=self._tokens_total,
         )
 
-    def _accumulate_last_usage(self, client: Optional[OpenAiMultimodalClient] = None) -> None:
+    def _accumulate_last_usage(self, client: Optional[GeminiMultimodalClient] = None) -> None:
         usage = getattr(client or self.llm, "last_usage", None)
         if not isinstance(usage, dict):
             return
@@ -776,15 +776,53 @@ class VisualAutomationAgent:
             self._memory.append(entry)
 
             self._raise_if_aborted()
-            narration = self.llm_agent.narrate_react_step(
-                system_prompt=SYSTEM_PROMPT,
-                last_action_done=last_action_done,
-                observation_of_last_action=observation_of_last_action,
-                rationale=str(out["rationale"]),
-                next_action=dict(out["next_action"]),
-            )
-            self._accumulate_last_usage(self.llm_agent)
-            self._raise_if_aborted()
+            try:
+                narration = self.llm_agent.narrate_react_step(
+                    system_prompt=SYSTEM_PROMPT,
+                    last_action_done=last_action_done,
+                    observation_of_last_action=observation_of_last_action,
+                    rationale=str(out["rationale"]),
+                    next_action=dict(out["next_action"]),
+                )
+                self._accumulate_last_usage(self.llm_agent)
+                self._raise_if_aborted()
+            except Exception:
+                # Narration is formatter-only; never let it crash the run if the model returns non-JSON.
+                rois = []
+                try:
+                    rois = list((observation_of_last_action or {}).get("rois", []) or [])
+                except Exception:
+                    rois = []
+
+                observe_text = "I skipped verification because there were no linked ROIs."
+                if rois:
+                    parts: list[str] = []
+                    try:
+                        results_map = (observation_of_last_action or {}).get("results", {}) or {}
+                        if isinstance(results_map, dict):
+                            for rn in rois[:4]:
+                                rv = results_map.get(rn, {}) if isinstance(rn, str) else {}
+                                if isinstance(rv, dict):
+                                    v = rv.get("value", None)
+                                    if v is not None:
+                                        parts.append(f"{rn}={v}")
+                    except Exception:
+                        parts = []
+                    observe_text = ("ROIs show: " + ", ".join(parts)) if parts else "ROIs were observed."
+
+                next_tool = str(out.get("next_action", {}).get("tool", "")).strip()
+                try:
+                    linked_rois = list((out.get("next_action", {}) or {}).get("linked_rois", []) or [])
+                except Exception:
+                    linked_rois = []
+                verify = f" and verify {', '.join(linked_rois[:4])}" if linked_rois else ""
+
+                narration = {
+                    "action": f"I ran {tool_name}.",
+                    "observe": observe_text,
+                    "think": str(out.get("rationale", "")).strip(),
+                    "next": f"Next I'll run {next_tool}{verify}." if next_tool else "Next I'll continue with the plan.",
+                }
 
             if not isinstance(narration, dict):
                 narration = {}
@@ -883,15 +921,19 @@ class VisualAutomationAgent:
                 and "summary_of_run" not in e
                 and "summary_of_last_run" not in e
             ]
-            summary_obj = self.llm_agent.summarize_run(
-                system_prompt=SYSTEM_PROMPT,
-                mode="agent",
-                plan_text=self._plan_text,
-                memory_entries=run_mem,
-                tool_results=self._tool_results_for_llm(tool_results=results),
-            )
-            self._accumulate_last_usage(self.llm_agent)
-            summary = str(summary_obj.get("summary", "")).strip() or "Finished."
+            try:
+                summary_obj = self.llm_agent.summarize_run(
+                    system_prompt=SYSTEM_PROMPT,
+                    mode="agent",
+                    plan_text=self._plan_text,
+                    memory_entries=run_mem,
+                    tool_results=self._tool_results_for_llm(tool_results=results),
+                )
+                self._accumulate_last_usage(self.llm_agent)
+                summary = str(summary_obj.get("summary", "")).strip() or "Finished."
+            except Exception:
+                # Summarization is best-effort; don't fail an otherwise successful run.
+                summary = "Finished."
             self._memory.append(
                 {
                     "t": self._now_iso(),

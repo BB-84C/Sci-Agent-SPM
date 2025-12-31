@@ -32,7 +32,7 @@ def _extract_json_object(text: str) -> Mapping[str, Any]:
     return obj
 
 
-def estimate_tokens(*, text: str, model: str = "gpt-5.2") -> int:
+def estimate_tokens(*, text: str, model: str = "gemini-1.5-pro") -> int:
     """
     Best-effort token estimate for the given text.
 
@@ -61,34 +61,227 @@ def _try_extract_json_object(text: str) -> Optional[Mapping[str, Any]]:
 
 @dataclass(frozen=True, slots=True)
 class LlmConfig:
-    model: str = "gpt-5.2"
+    model: str = "gemini-1.5-pro"
     timeout_s: float = 60.0
 
 
-class OpenAiMultimodalClient:
+@dataclass(frozen=True, slots=True)
+class _CompatUsage:
+    input_tokens: int = 0
+    output_tokens: int = 0
+    total_tokens: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class _CompatResponse:
+    output_text: str
+    usage: _CompatUsage
+
+
+def _data_url_to_bytes(data_url: str) -> tuple[bytes, str]:
     """
-    Minimal OpenAI client wrapper.
-    Reads API key from env var OPENAI_API (per user request); also falls back to OPENAI_API_KEY.
+    Decode a data URL (e.g., data:image/png;base64,...) into raw bytes + mime_type.
+    """
+    u = str(data_url or "").strip()
+    if not u.startswith("data:"):
+        raise ValueError("Only data: URLs are supported for images.")
+    try:
+        header, b64 = u.split(",", 1)
+    except ValueError as e:
+        raise ValueError("Invalid data: URL (missing comma).") from e
+    mime = header[5:]
+    if ";" in mime:
+        mime = mime.split(";", 1)[0]
+    if not mime:
+        mime = "application/octet-stream"
+    try:
+        raw = base64.b64decode(b64)
+    except Exception as e:
+        raise ValueError("Invalid data: URL base64 payload.") from e
+    return raw, mime
+
+
+class _GeminiResponsesCompat:
+    """
+    Compatibility shim for the subset of the OpenAI Responses API used in this repo.
     """
 
-    def __init__(self, config: LlmConfig) -> None:
-        self._config = config
-        self.last_usage: dict[str, int] = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
-        key = os.getenv("OPENAI_API") or os.getenv("OPENAI_API_KEY")
-        if not key:
-            raise RuntimeError("Missing OpenAI API key: set env var OPENAI_API (or OPENAI_API_KEY).")
+    def __init__(self, genai_client: Any) -> None:
+        self._genai_client = genai_client
+
+    def create(
+        self,
+        *,
+        model: str,
+        input: list[Mapping[str, Any]],
+        timeout: float | None = None,
+        tool_choice: str | None = None,
+        max_output_tokens: int | None = None,
+        **_kwargs: Any,
+    ) -> _CompatResponse:
+        # Notes:
+        # - `timeout` and `tool_choice` are accepted for API compatibility but are not used here.
+        # - We rely on prompt instructions + response_mime_type to obtain JSON.
+        _ = timeout, tool_choice
+
+        system_texts: list[str] = []
+        user_parts: list[Any] = []
+        for msg in input or []:
+            role = str(msg.get("role", "")).strip().lower()
+            content = msg.get("content", "")
+            if role == "system":
+                if isinstance(content, str):
+                    system_texts.append(content)
+                else:
+                    system_texts.append(str(content))
+                continue
+
+            if role != "user":
+                # Treat non-system roles as user content.
+                role = "user"
+
+            if isinstance(content, str):
+                user_parts.append(("text", content))
+            elif isinstance(content, list):
+                for part in content:
+                    if not isinstance(part, Mapping):
+                        user_parts.append(("text", str(part)))
+                        continue
+                    ptype = str(part.get("type", "")).strip().lower()
+                    if ptype == "input_text":
+                        user_parts.append(("text", str(part.get("text", ""))))
+                    elif ptype == "input_image":
+                        raw, mime = _data_url_to_bytes(str(part.get("image_url", "")))
+                        user_parts.append(("bytes", raw, mime))
+                    else:
+                        # Unknown part type; preserve as text.
+                        user_parts.append(("text", str(part)))
+            else:
+                user_parts.append(("text", str(content)))
+
+        system_text = "\n\n".join([t for t in system_texts if str(t).strip()]).strip()
 
         try:
-            from openai import OpenAI
+            from google.genai import types  # type: ignore
         except Exception as e:
             raise RuntimeError(
-                "Missing dependency 'openai' for agent mode.\n"
+                "Missing dependency 'google-genai' for Gemini API.\n"
                 f"Python: {sys.executable}\n"
                 "Fix: python -m pip install -r requirements.txt\n"
                 "Tip: ensure you're using the same Python/venv you run the program with."
             ) from e
 
-        self._client = OpenAI(api_key=key)
+        parts: list[Any] = []
+        for p in user_parts:
+            if not p:
+                continue
+            if p[0] == "text":
+                txt = str(p[1] or "")
+                if txt:
+                    parts.append(types.Part.from_text(text=txt))
+            elif p[0] == "bytes":
+                raw = p[1]
+                mime = p[2]
+                if raw:
+                    parts.append(types.Part.from_bytes(data=raw, mime_type=str(mime or "application/octet-stream")))
+
+        cfg: Any = types.GenerateContentConfig(
+            system_instruction=system_text if system_text else None,
+            max_output_tokens=int(max_output_tokens) if max_output_tokens is not None else None,
+            response_mime_type="application/json",
+        )
+
+        # Some models / SDK versions may not support response_mime_type; retry without it.
+        try:
+            resp = self._genai_client.models.generate_content(
+                model=model,
+                contents=[types.Content(role="user", parts=parts)],
+                config=cfg,
+            )
+        except Exception:
+            cfg = types.GenerateContentConfig(
+                system_instruction=system_text if system_text else None,
+                max_output_tokens=int(max_output_tokens) if max_output_tokens is not None else None,
+            )
+            resp = self._genai_client.models.generate_content(
+                model=model,
+                contents=[types.Content(role="user", parts=parts)],
+                config=cfg,
+            )
+
+        out_text = ""
+        try:
+            out_text = str(getattr(resp, "text", "") or "")
+        except Exception:
+            out_text = ""
+        if not out_text:
+            # Fallback extraction from candidate parts.
+            try:
+                candidates = getattr(resp, "candidates", None) or []
+                if candidates:
+                    c0 = candidates[0]
+                    content0 = getattr(c0, "content", None)
+                    parts0 = getattr(content0, "parts", None) or []
+                    texts: list[str] = []
+                    for pp in parts0:
+                        t = getattr(pp, "text", None)
+                        if isinstance(t, str) and t:
+                            texts.append(t)
+                    out_text = "\n".join(texts).strip()
+            except Exception:
+                out_text = ""
+
+        usage = _CompatUsage()
+        um = getattr(resp, "usage_metadata", None)
+        if um is not None:
+            def _to_i(v: Any) -> int:
+                try:
+                    if isinstance(v, bool):
+                        return 0
+                    return int(v)
+                except Exception:
+                    return 0
+
+            in_tok = _to_i(getattr(um, "prompt_token_count", None))
+            out_tok = _to_i(getattr(um, "candidates_token_count", None))
+            total = _to_i(getattr(um, "total_token_count", None))
+            if total <= 0:
+                total = max(0, in_tok + out_tok)
+            usage = _CompatUsage(input_tokens=in_tok, output_tokens=out_tok, total_tokens=total)
+
+        return _CompatResponse(output_text=out_text, usage=usage)
+
+
+class _GeminiClientCompat:
+    def __init__(self, *, api_key: str) -> None:
+        try:
+            from google import genai  # type: ignore
+        except Exception as e:
+            raise RuntimeError(
+                "Missing dependency 'google-genai' for Gemini API.\n"
+                f"Python: {sys.executable}\n"
+                "Fix: python -m pip install -r requirements.txt\n"
+                "Tip: ensure you're using the same Python/venv you run the program with."
+            ) from e
+
+        self._genai_client = genai.Client(api_key=api_key)
+        self.responses = _GeminiResponsesCompat(self._genai_client)
+
+
+class GeminiMultimodalClient:
+    """
+    Minimal Gemini client wrapper (via google-genai).
+    Reads API key from env var GEMINI_API_KEY; also falls back to GOOGLE_API_KEY.
+    """
+
+    def __init__(self, config: LlmConfig) -> None:
+        self._config = config
+        self.last_usage: dict[str, int] = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+        key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+        if not key:
+            raise RuntimeError("Missing Gemini API key: set env var GEMINI_API_KEY (or GOOGLE_API_KEY).")
+
+        self._client = _GeminiClientCompat(api_key=key)
 
     def _set_last_usage(self, resp: Any) -> None:
         usage = getattr(resp, "usage", None)
@@ -311,7 +504,7 @@ class OpenAiMultimodalClient:
             f"LAST_ACTION_DONE:\n{last_json}\n\n"
             f"OBSERVATION_OF_LAST_ACTION:\n{obs_json}\n\n"
             f"WORKSPACE (summary):\n{ws_json}\n\n"
-            f"TOOLS (OpenAI function schemas):\n{tools_json}\n\n"
+            f"TOOLS (function schemas):\n{tools_json}\n\n"
             "Return ONLY valid JSON."
         )
         resp = self._client.responses.create(
@@ -639,7 +832,10 @@ class OpenAiMultimodalClient:
         obj = _try_extract_json_object(last_text)
         if obj is not None:
             return obj
-        raise ValueError(f"summarize_run: model did not return valid JSON. Last output: {last_text[:500]!r}")
+        # Never crash the app due to summarization formatting issues.
+        # Gemini may occasionally return empty text or non-JSON despite instructions.
+        fallback = "Finished." if m == "agent" else "(no summary)"
+        return {"summary": fallback}
 
     def compression_memory(
         self,
@@ -790,14 +986,14 @@ class OpenAiMultimodalClient:
 
 def compression_memory(
     *,
-    client: OpenAiMultimodalClient,
+    client: GeminiMultimodalClient,
     system_prompt: str,
     memory_entries: list[Mapping[str, Any]],
     archive_memory_entries: list[Mapping[str, Any]] | None = None,
     tool_results_by_run: Mapping[int, list[Mapping[str, Any]]] | None = None,
 ) -> Mapping[str, Any]:
     """
-    Convenience wrapper around `OpenAiMultimodalClient.compression_memory(...)`.
+    Convenience wrapper around `GeminiMultimodalClient.compression_memory(...)`.
     """
     return client.compression_memory(
         system_prompt=system_prompt,
@@ -805,4 +1001,8 @@ def compression_memory(
         archive_memory_entries=archive_memory_entries,
         tool_results_by_run=tool_results_by_run,
     )
+
+
+# Back-compat alias for the previous class name.
+OpenAiMultimodalClient = GeminiMultimodalClient
 
