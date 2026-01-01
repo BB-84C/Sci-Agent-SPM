@@ -2,10 +2,10 @@
   "rois": [
     {
       "name": "bias_readout",
-      "x": 554,
-      "y": 292,
-      "w": 169,
-      "h": 50,
+      "x": 360,
+      "y": 202,
+      "w": 119,
+      "h": 30,
       "description": "ROI covering the displayed bias value (V) in Nanonis.",
       "tags": [
         "readout",
@@ -14,10 +14,10 @@
     },
     {
       "name": "scan_status",
-      "x": 2855,
-      "y": 51,
-      "w": 63,
-      "h": 56,
+      "x": 891,
+      "y": 39,
+      "w": 43,
+      "h": 39,
       "description": "ROI covering scan status. It only tells the current status of scanning: <scanning>, <paused>, and <idle>, if you need to get how long the scanning will take, refer to the scan time countdown ROI. It's an icon made of 2 black bars. If the Icon is in black, then it means the scanning is in progress, return <scanning>. If the icon is in black and has a square gray shadow background, then it means the scanning is on paused, return: <paused>. If the icon is in faded gray color, it means there's no scanning in progress, return <idle>. Note that sometimes the LLM will fail distinguishing image to be <paused> or <idle>, it is not uncommom. So if you see the scanning countdown is already zero, and the scanning status is identified as <paused>, it's actually in <idle>. ",
       "tags": [
         "status",
@@ -26,10 +26,10 @@
     },
     {
       "name": "set_current_readout",
-      "x": 25,
-      "y": 810,
-      "w": 110,
-      "h": 33,
+      "x": 6,
+      "y": 457,
+      "w": 82,
+      "h": 24,
       "description": "ROI covering the displayed set current value (A) in Nanonis. It does not always equal to the real current. Since this set current is only used in the constant-current-scanning mode to set the current that STM tries to maintain. But the actual real current depends on the tip's microscopical geometry and the electronic status. ",
       "tags": [
         "readout",
@@ -38,10 +38,10 @@
     },
     {
       "name": "scan_time_countdown_readout",
-      "x": 3425,
-      "y": 153,
-      "w": 239,
-      "h": 87,
+      "x": 1274,
+      "y": 115,
+      "w": 153,
+      "h": 48,
       "description": "The scan time count down indicated the time that current scan needs to finish. If you need to decide how long to wait for the scanning, refer to this ROI. ",
       "tags": [
         "readout",
@@ -50,10 +50,10 @@
     },
     {
       "name": "real_current_readout",
-      "x": 534,
-      "y": 763,
-      "w": 159,
-      "h": 88,
+      "x": 361,
+      "y": 440,
+      "w": 91,
+      "h": 46,
       "description": "ROI covering the displayed real current value (A) in Nanonis.",
       "tags": [
         "readout real current"
@@ -63,8 +63,8 @@
   "anchors": [
     {
       "name": "bias_input",
-      "x": 652,
-      "y": 319,
+      "x": 380,
+      "y": 220,
       "description": "Anchor point of bias input box. Remember the unit \"V\" embedded in the box is not part of the input value. For example, if you need to input 700mV, return either \"0.7\" or \"700m\".",
       "tags": [
         "input",
@@ -76,8 +76,8 @@
     },
     {
       "name": "scan_start_from_top_button",
-      "x": 2728,
-      "y": 76,
+      "x": 805,
+      "y": 55,
       "description": "Click target on the Start Scan From Top button.",
       "tags": [
         "button",
@@ -90,8 +90,8 @@
     },
     {
       "name": "scan_start_from_bottom_button",
-      "x": 2679,
-      "y": 81,
+      "x": 774,
+      "y": 57,
       "description": "Click target on the Start Scan From bottom button.",
       "tags": [
         "button",
@@ -104,8 +104,8 @@
     },
     {
       "name": "set_current_input",
-      "x": 79,
-      "y": 822,
+      "x": 22,
+      "y": 471,
       "description": "Anchor point of current input box. Remember the unit \"A\" embedded in the box is not part of the input value. For example, if you need to input 50pA, return either \"0.000000000005\" or \"50p\" the cap of this input is 10nA.",
       "tags": [
         "input",
