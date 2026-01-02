@@ -1,6 +1,6 @@
 # Sci-Agent-SPM
 
-![alt text](./assets/image.png)
+![alt text](./assets/ChatGPT%20Image%20Jan%202,%202026,%2012_03_41%20PM.png)
 
 A **visual automation agent** for running **Scanning Probe Microscope (SPM)** instruments:
 
@@ -9,6 +9,7 @@ A **visual automation agent** for running **Scanning Probe Microscope (SPM)** in
 - **Long-horizon execution**: ReAct based operation that can carry multi-step experiments across different open-ended experimental scenarios and run stably over a long period of time. Translation: it helps you do experiments while you sleep.
 - **Structured context + modular memory**: persistent sessions, structured run memory, and automatic memory compression.
 
+![alt text](./assets/image.png)
 
 ## What It Can Do
 
