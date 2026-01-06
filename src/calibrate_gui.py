@@ -163,6 +163,8 @@ class CalibratorApp(tk.Tk):
         self._screen_photo: Optional[ImageTk.PhotoImage] = None
         self._screen_bbox: tuple[int, int, int, int] = (0, 0, 0, 0)  # left, top, width, height
         self._scale: float = 1.0
+        self._fit_scale: float = 1.0
+        self._zoom: float = 1.0
         self._render_job: Optional[str] = None
         self._suppress_form_events: bool = False
 
@@ -183,11 +185,21 @@ class CalibratorApp(tk.Tk):
         self.rowconfigure(0, weight=1)
 
         left = ttk.Frame(self, padding=8)
-        left.grid(row=0, column=0, sticky="nsw")
+        left.grid(row=0, column=0, sticky="nsew")
+        left.columnconfigure(0, weight=1)
+        left.rowconfigure(1, weight=1)
 
         ttk.Label(left, text="Items").grid(row=0, column=0, sticky="w")
-        self.items_list = tk.Listbox(left, width=36, height=28, exportselection=False)
-        self.items_list.grid(row=1, column=0, sticky="nsew")
+        items_frame = ttk.Frame(left)
+        items_frame.grid(row=1, column=0, sticky="nsew")
+        items_frame.columnconfigure(0, weight=1)
+        items_frame.rowconfigure(0, weight=1)
+
+        self.items_list = tk.Listbox(items_frame, width=36, height=14, exportselection=False)
+        items_scroll = ttk.Scrollbar(items_frame, orient="vertical", command=self.items_list.yview)
+        self.items_list.configure(yscrollcommand=items_scroll.set)
+        self.items_list.grid(row=0, column=0, sticky="nsew")
+        items_scroll.grid(row=0, column=1, sticky="ns")
         self.items_list.bind("<<ListboxSelect>>", lambda _e: self._on_select(populate_form=True))
 
         btns = ttk.Frame(left)
@@ -254,12 +266,23 @@ class CalibratorApp(tk.Tk):
         right.columnconfigure(0, weight=1)
         right.rowconfigure(0, weight=1)
 
-        self.canvas = tk.Canvas(right, bg="#111111", highlightthickness=0)
+        preview = ttk.Frame(right)
+        preview.grid(row=0, column=0, sticky="nsew")
+        preview.columnconfigure(0, weight=1)
+        preview.rowconfigure(0, weight=1)
+
+        self.canvas = tk.Canvas(preview, bg="#111111", highlightthickness=0)
         self.canvas.grid(row=0, column=0, sticky="nsew")
+        h_scroll = ttk.Scrollbar(preview, orient="horizontal", command=self.canvas.xview)
+        v_scroll = ttk.Scrollbar(preview, orient="vertical", command=self.canvas.yview)
+        h_scroll.grid(row=1, column=0, sticky="ew")
+        v_scroll.grid(row=0, column=1, sticky="ns")
+        self.canvas.configure(xscrollcommand=h_scroll.set, yscrollcommand=v_scroll.set)
         self.canvas.bind("<ButtonPress-1>", self._on_mouse_down)
         self.canvas.bind("<B1-Motion>", self._on_mouse_move)
         self.canvas.bind("<ButtonRelease-1>", self._on_mouse_up)
         self.canvas.bind("<Configure>", self._on_canvas_resize)
+        self.canvas.bind("<Control-MouseWheel>", self._on_zoom)
 
         help_txt = (
             "Workflow:\n"
@@ -587,7 +610,8 @@ class CalibratorApp(tk.Tk):
 
         sx = canvas_w / img_w
         sy = canvas_h / img_h
-        self._scale = min(sx, sy, 1.0)
+        self._fit_scale = min(sx, sy, 1.0)
+        self._scale = max(0.05, self._fit_scale * self._zoom)
 
         if self._scale < 1.0:
             resized = self._screen_img.resize(
@@ -612,12 +636,16 @@ class CalibratorApp(tk.Tk):
 
     def _canvas_to_screen(self, cx: int, cy: int) -> tuple[int, int]:
         left, top, _, _ = self._screen_bbox
+        if self._scale <= 0:
+            return left, top
         x = int(left + (cx / self._scale))
         y = int(top + (cy / self._scale))
         return x, y
 
     def _screen_to_canvas(self, x: int, y: int) -> tuple[int, int]:
         left, top, _, _ = self._screen_bbox
+        if self._scale <= 0:
+            return 0, 0
         cx = int((x - left) * self._scale)
         cy = int((y - top) * self._scale)
         return cx, cy
@@ -654,17 +682,78 @@ class CalibratorApp(tk.Tk):
             self.canvas.create_oval(cx - r, cy - r, cx + r, cy + r, outline="#ffcc00", width=2),
         ]
 
+    def _on_zoom(self, e: tk.Event) -> str:
+        if self.mode in {"draw_roi", "pick_anchor"}:
+            return "break"
+        if self._screen_img is None:
+            return "break"
+        if getattr(e, "delta", 0) == 0:
+            return "break"
+
+        old_scale = self._scale if self._scale > 0 else 1.0
+        direction = 1 if e.delta > 0 else -1
+        zoom_factor = 1.1 if direction > 0 else (1 / 1.1)
+        new_zoom = self._zoom * zoom_factor
+        new_zoom = max(0.25, min(6.0, new_zoom))
+        if abs(new_zoom - self._zoom) < 1e-6:
+            return "break"
+
+        canvas = self.canvas
+        pointer_x = canvas.canvasx(int(getattr(e, "x", 0)))
+        pointer_y = canvas.canvasy(int(getattr(e, "y", 0)))
+        view_x = canvas.canvasx(0)
+        view_y = canvas.canvasy(0)
+        offset_x = pointer_x - view_x
+        offset_y = pointer_y - view_y
+
+        self._zoom = new_zoom
+        self._render_canvas_image()
+
+        new_scale = self._scale if self._scale > 0 else 1.0
+        scale_ratio = new_scale / old_scale
+        new_pointer_x = pointer_x * scale_ratio
+        new_pointer_y = pointer_y * scale_ratio
+        new_view_x = new_pointer_x - offset_x
+        new_view_y = new_pointer_y - offset_y
+        self._scroll_canvas_to(new_view_x, new_view_y)
+        return "break"
+
+    def _scroll_canvas_to(self, x: float, y: float) -> None:
+        try:
+            width = float(self.canvas.winfo_width())
+            height = float(self.canvas.winfo_height())
+            region = self.canvas.bbox("all")
+            if not region:
+                return
+            x0, y0, x1, y1 = region
+            region_w = float(x1 - x0)
+            region_h = float(y1 - y0)
+            if region_w > width:
+                x = max(0.0, min(x, region_w - width))
+                self.canvas.xview_moveto(x / region_w)
+            else:
+                self.canvas.xview_moveto(0.0)
+            if region_h > height:
+                y = max(0.0, min(y, region_h - height))
+                self.canvas.yview_moveto(y / region_h)
+            else:
+                self.canvas.yview_moveto(0.0)
+        except Exception:
+            pass
+
     def _on_mouse_down(self, e: tk.Event) -> None:
         if self._screen_img is None:
             return
+        cx = int(self.canvas.canvasx(e.x))
+        cy = int(self.canvas.canvasy(e.y))
         if self.mode == "draw_roi":
-            self._draw_start = (int(e.x), int(e.y))
+            self._draw_start = (cx, cy)
             self._clear_overlay()
-            self._active_rect_id = self.canvas.create_rectangle(e.x, e.y, e.x, e.y, outline="#00d1ff", width=2)
+            self._active_rect_id = self.canvas.create_rectangle(cx, cy, cx, cy, outline="#00d1ff", width=2)
         elif self.mode == "pick_anchor":
             if self._drawing_item_index is None:
                 return
-            sx, sy = self._canvas_to_screen(int(e.x), int(e.y))
+            sx, sy = self._canvas_to_screen(cx, cy)
             idx = self._drawing_item_index
             a = self.anchors[idx]
             self.anchors[idx] = AnchorDraft(
@@ -680,8 +769,10 @@ class CalibratorApp(tk.Tk):
     def _on_mouse_move(self, e: tk.Event) -> None:
         if self.mode != "draw_roi" or self._draw_start is None or self._active_rect_id is None:
             return
+        cx = int(self.canvas.canvasx(e.x))
+        cy = int(self.canvas.canvasy(e.y))
         x0, y0 = self._draw_start
-        self.canvas.coords(self._active_rect_id, x0, y0, int(e.x), int(e.y))
+        self.canvas.coords(self._active_rect_id, x0, y0, cx, cy)
 
     def _on_mouse_up(self, e: tk.Event) -> None:
         if self.mode != "draw_roi" or self._draw_start is None:
@@ -690,7 +781,7 @@ class CalibratorApp(tk.Tk):
             return
 
         x0, y0 = self._draw_start
-        x1, y1 = int(e.x), int(e.y)
+        x1, y1 = int(self.canvas.canvasx(e.x)), int(self.canvas.canvasy(e.y))
         self._draw_start = None
 
         cx1, cy1 = min(x0, x1), min(y0, y1)
