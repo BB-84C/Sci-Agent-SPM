@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -15,6 +15,7 @@ class Roi:
     h: int
     description: str = ""
     tags: tuple[str, ...] = ()
+    active: bool = True
 
     def as_bbox(self) -> tuple[int, int, int, int]:
         return (self.x, self.y, self.w, self.h)
@@ -28,6 +29,7 @@ class Anchor:
     description: str = ""
     tags: tuple[str, ...] = ()
     linked_rois: tuple[str, ...] = ()
+    active: bool = True
 
     def as_point(self) -> tuple[int, int]:
         return (self.x, self.y)
@@ -70,6 +72,20 @@ def _require_int(obj: Mapping[str, Any], key: str) -> int:
     return value
 
 
+def _parse_active(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"true", "1", "yes", "y"}:
+            return True
+        if lowered in {"false", "0", "no", "n"}:
+            return False
+    return True
+
+
 def load_workspace(path: str | Path) -> Workspace:
     p = Path(path)
     raw = json.loads(p.read_text(encoding="utf-8"))
@@ -100,6 +116,7 @@ def load_workspace(path: str | Path) -> Workspace:
                 h=_require_int(item, "h"),
                 description=str(item.get("description", "")),
                 tags=_parse_tags(item.get("tags")),
+                active=_parse_active(item.get("active", True)),
             )
         )
 
@@ -124,8 +141,13 @@ def load_workspace(path: str | Path) -> Workspace:
                 description=str(item.get("description", "")),
                 tags=_parse_tags(item.get("tags")),
                 linked_rois=linked,
+                active=_parse_active(item.get("active", True)),
             )
         )
+
+    forced_rois = {r for a in anchors if a.active for r in a.linked_rois}
+    if forced_rois:
+        rois = [replace(r, active=True) if r.name in forced_rois else r for r in rois]
 
     for r in rois:
         if not r.name:

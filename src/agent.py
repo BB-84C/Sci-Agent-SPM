@@ -339,14 +339,19 @@ class VisualAutomationAgent:
     def _workspace_info(self) -> dict[str, Any]:
         rois: list[dict[str, Any]] = []
         for r in self.workspace.rois:
+            if not r.active:
+                continue
             rois.append({"name": r.name, "description": r.description or ""})
+        active_roi_names = {r["name"] for r in rois}
         anchors: list[dict[str, Any]] = []
         for a in self.workspace.anchors:
+            if not a.active:
+                continue
             anchors.append(
                 {
                     "name": a.name,
                     "description": a.description or "",
-                    "linked_rois": list(a.linked_rois or []),
+                    "linked_rois": [r for r in (a.linked_rois or []) if r in active_roi_names],
                 }
             )
         return {"workspace_path": str(self.workspace.source_path), "rois": rois, "anchors": anchors}
@@ -368,7 +373,10 @@ class VisualAutomationAgent:
             anchor = args.get("anchor", None)
             if isinstance(anchor, str) and anchor.strip():
                 try:
-                    linked = list(self.workspace.anchor(anchor.strip()).linked_rois or [])
+                    anchor_obj = self.workspace.anchor(anchor.strip())
+                    if not anchor_obj.active:
+                        return []
+                    linked = list(anchor_obj.linked_rois or [])
                     return [x for x in linked if isinstance(x, str) and x.strip()]
                 except Exception:
                     return []
@@ -382,8 +390,10 @@ class VisualAutomationAgent:
                 continue
             rr = r.strip()
             try:
-                self.workspace.roi(rr)
+                roi = self.workspace.roi(rr)
             except Exception:
+                continue
+            if not roi.active:
                 continue
             out.append(rr)
         return out
@@ -398,7 +408,12 @@ class VisualAutomationAgent:
             rr = str(r).strip()
             if not rr:
                 continue
-            resolved.append(self.workspace.roi(rr))
+            roi = self.workspace.roi(rr)
+            if not roi.active:
+                continue
+            resolved.append(roi)
+        if not resolved:
+            return {"rois": [], "results": {}, "unreadable": []}
         roi_names = [r.name for r in resolved]
         roi_descs = [r.description or "" for r in resolved]
 

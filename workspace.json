@@ -2,11 +2,12 @@
   "rois": [
     {
       "name": "bias_readout",
-      "x": 554,
-      "y": 292,
-      "w": 169,
-      "h": 50,
+      "x": -1067,
+      "y": 231,
+      "w": 114,
+      "h": 34,
       "description": "ROI covering the displayed bias value (V) in Nanonis.",
+      "active": true,
       "tags": [
         "readout",
         "bias"
@@ -14,11 +15,12 @@
     },
     {
       "name": "scan_status",
-      "x": 2855,
-      "y": 51,
-      "w": 63,
-      "h": 56,
-      "description": "ROI covering scan status. It only tells the current status of scanning: <scanning>, <paused>, and <idle>, if you need to get how long the scanning will take, refer to the scan time countdown ROI. It's an icon made of 2 black bars. If the Icon is in black, then it means the scanning is in progress, return <scanning>. If the icon is in black and has a square gray shadow background, then it means the scanning is on paused, return: <paused>. If the icon is in faded gray color, it means there's no scanning in progress, return <idle>. Note that sometimes the LLM will fail distinguishing image to be <paused> or <idle>, it is not uncommom. So if you see the scanning countdown is already zero, and the scanning status is identified as <paused>, it's actually in <idle>. ",
+      "x": 412,
+      "y": 48,
+      "w": 37,
+      "h": 36,
+      "description": "ROI covering scan status. It only tells the current status of scanning: <scanning>, <paused>, and <idle>, if you need to get how long the scanning will take, refer to the scan time countdown ROI. It's an icon made of 2 black bars. If the Icon is in black, then it means the scanning is in progress, return <scanning>. If the icon is in black and has a square gray shadow background, then it means the scanning is on paused, return: <paused>. If the icon is in faded gray color, it means there's no scanning in progress, return <idle>. Note that sometimes the LLM will fail distinguishing image between <scanning>, <paused> or <idle>, it is not uncommom. So if you see the scanning countdown is already zero, and the scanning status is identified as <scanning> or <paused>, it's actually in <idle>. As long as the the scanning status is in either <paused> or <idle>, you can start another scanning or proceed to change any parameters, it's totally safe. ",
+      "active": true,
       "tags": [
         "status",
         "scan"
@@ -26,11 +28,12 @@
     },
     {
       "name": "set_current_readout",
-      "x": 25,
-      "y": 810,
-      "w": 110,
-      "h": 33,
+      "x": -1415,
+      "y": 557,
+      "w": 83,
+      "h": 57,
       "description": "ROI covering the displayed set current value (A) in Nanonis. It does not always equal to the real current. Since this set current is only used in the constant-current-scanning mode to set the current that STM tries to maintain. But the actual real current depends on the tip's microscopical geometry and the electronic status. ",
+      "active": true,
       "tags": [
         "readout",
         "set current"
@@ -38,11 +41,12 @@
     },
     {
       "name": "scan_time_countdown_readout",
-      "x": 3425,
-      "y": 153,
-      "w": 239,
-      "h": 87,
+      "x": 1169,
+      "y": 120,
+      "w": 161,
+      "h": 51,
       "description": "The scan time count down indicated the time that current scan needs to finish. If you need to decide how long to wait for the scanning, refer to this ROI. ",
+      "active": true,
       "tags": [
         "readout",
         "scan_time_countdown"
@@ -50,22 +54,86 @@
     },
     {
       "name": "real_current_readout",
-      "x": 534,
-      "y": 763,
-      "w": 159,
-      "h": 88,
+      "x": -1070,
+      "y": 540,
+      "w": 88,
+      "h": 38,
       "description": "ROI covering the displayed real current value (A) in Nanonis.",
+      "active": true,
       "tags": [
-        "readout real current"
+        "readout",
+        "real_current"
+      ]
+    },
+    {
+      "name": "read_scan_speed_ms",
+      "x": 5,
+      "y": 237,
+      "w": 124,
+      "h": 21,
+      "description": "ROI that describes the tip scanning speed, the unit is in m/s. ",
+      "active": true,
+      "tags": [
+        "readout",
+        "scan_speed"
+      ]
+    },
+    {
+      "name": "read_scan_speed_time_line",
+      "x": 7,
+      "y": 256,
+      "w": 118,
+      "h": 23,
+      "description": "ROI that describes the tip scanning speed, the unit is in time (s), it means the time per each line to scan. For example, if the reaout says 678.4m, it means the current scanning speed is at 678.4ms per line. The set_scan_speed_ms ROI is basically showing the same information, except in differnt unit. This is to evaluate the scanning speed from differnt perspective.  ",
+      "active": true,
+      "tags": [
+        "readout",
+        "scan_speed"
+      ]
+    },
+    {
+      "name": "read_scan_frame_size",
+      "x": 113,
+      "y": 145,
+      "w": 52,
+      "h": 35,
+      "description": "ROI that covered the scan frame size. The unit is in meter (m). For example: if the target is to have the scan frame size be 50nm, you would expect to observe 50n.",
+      "active": true
+    },
+    {
+      "name": "read_time_per_frame",
+      "x": 147,
+      "y": 256,
+      "w": 118,
+      "h": 25,
+      "description": "This ROI shows the expected time to finish a scan given the scan speed. If you are asked to set a map that finish in <x> minute, this ROI is where you should check. ",
+      "active": true,
+      "tags": [
+        "readout",
+        "scan_time_per_frame"
+      ]
+    },
+    {
+      "name": "read_scan_image_resolution",
+      "x": 6,
+      "y": 386,
+      "w": 90,
+      "h": 30,
+      "description": "This ROI shows the resolution (in pixles) of the image that will be scanned. Usually 256 is good for 10-30nm frame size, 352 is good for 40-60nm, 448 or 640 is good for 90+nm. The bigger the resolution, the clearer of the image, but the time for each scan to finish will increase exponentally. ",
+      "active": true,
+      "tags": [
+        "readout",
+        "image_resolution"
       ]
     }
   ],
   "anchors": [
     {
       "name": "bias_input",
-      "x": 652,
-      "y": 319,
+      "x": -1038,
+      "y": 248,
       "description": "Anchor point of bias input box. Remember the unit \"V\" embedded in the box is not part of the input value. For example, if you need to input 700mV, return either \"0.7\" or \"700m\".",
+      "active": true,
       "tags": [
         "input",
         "bias"
@@ -76,9 +144,10 @@
     },
     {
       "name": "scan_start_from_top_button",
-      "x": 2728,
-      "y": 76,
+      "x": 325,
+      "y": 63,
       "description": "Click target on the Start Scan From Top button.",
+      "active": true,
       "tags": [
         "button",
         "scan from top"
@@ -90,9 +159,10 @@
     },
     {
       "name": "scan_start_from_bottom_button",
-      "x": 2679,
-      "y": 81,
+      "x": 292,
+      "y": 68,
       "description": "Click target on the Start Scan From bottom button.",
+      "active": true,
       "tags": [
         "button",
         "scan from bottom"
@@ -104,15 +174,91 @@
     },
     {
       "name": "set_current_input",
-      "x": 79,
-      "y": 822,
-      "description": "Anchor point of current input box. Remember the unit \"A\" embedded in the box is not part of the input value. For example, if you need to input 50pA, return either \"0.000000000005\" or \"50p\" the cap of this input is 10nA.",
+      "x": -1403,
+      "y": 596,
+      "description": "Anchor point of current input box. Remember the unit \"A\" embedded in the box is not part of the input value. For example, if you need to input 50pA, return either \"0.000000000005\" or \"50p\". The cap of this input is 10nA.",
+      "active": true,
       "tags": [
         "input",
         "current"
       ],
       "linked_ROIs": [
         "set_current_readout"
+      ]
+    },
+    {
+      "name": "set_scan_speed_time_line",
+      "x": 79,
+      "y": 269,
+      "description": "The anchor point to click when deciding to set the scaning speed. Thi anchor specifically set the scan speed in unit \"time/line\", for example, if you want to set the scan speed to 400ms/line, input 400m or 0.4. If the user ask to set the scan speed in m/s unit, you need to refer to the read_scan_frame_size, and convert the user specified scan speed into the line/s unit. For example, the user ask to set the scan speed to 50nm/s, you need to take a look at the scan frame size (let's say it is 75nm), then your input for this anchor should be 1.5 or 1500m, since 75/50 = 1.5. Sometimes user will just simply ask to set a map that finished in <x> minutes, you need to calculate the total times in seconds and divid it by the twice of the pixels size (becuase of forward scan and backward scan, one line will always be scanned twice.). For example, user ask to set the map that finishes in 5min 47s, the pixel is set to 256, thus the scan time you should input is 678m, since 5min47s/(2*256pixel) = 678.4ms. NOTE: The nanonis only allow certain values as the input, expect small differnce. For example, if you set the scan speed to be 170m/s, but observed 176.2m/s as result, that's nanonis automatically set the input to the closest allowed value, live with that and don't have to try to reset the input to be exact 170m/s since nanonis will never let you set that value. ",
+      "active": true,
+      "tags": [
+        "input",
+        "scan_speed"
+      ],
+      "linked_ROIs": [
+        "read_scan_speed_ms",
+        "read_scan_speed_time_line",
+        "read_scan_frame_size",
+        "read_time_per_frame",
+        "read_scan_image_resolution"
+      ]
+    },
+    {
+      "name": "set_imgae_resolutin",
+      "x": 53,
+      "y": 401,
+      "description": "Here is where you set the resolution of the image to be scanned. The unit is in pixles. so if user ask you to set the scan image resolution to be 512x512, your input should be 512. ",
+      "active": true,
+      "tags": [
+        "input",
+        "imgae_resolutin"
+      ],
+      "linked_ROIs": [
+        "read_scan_image_resolution"
+      ]
+    },
+    {
+      "name": "set_scan_frame_size",
+      "x": 123,
+      "y": 173,
+      "description": "The anchor to click if you are going to set the scan frame size. The unit is in meter (m). Example: user asked to set the frame size to be 15nm, your input should be 15, user asked the frame size to be 1.5nm, your input should be 1.5n or 1500p.",
+      "active": true,
+      "tags": [
+        "input",
+        "scan_frame_size"
+      ],
+      "linked_ROIs": [
+        "read_scan_frame_size"
+      ]
+    },
+    {
+      "name": "pause_scan",
+      "x": 429,
+      "y": 64,
+      "description": "anchor point to click when you want to pause the present scaning. ",
+      "active": true,
+      "tags": [
+        "button",
+        "pause_scan"
+      ],
+      "linked_ROIs": [
+        "scan_status"
+      ]
+    },
+    {
+      "name": "stop_scan",
+      "x": 495,
+      "y": 68,
+      "description": "Anchor point to click when you need to stop the present scan completely. ",
+      "active": true,
+      "tags": [
+        "button",
+        "stop_scan"
+      ],
+      "linked_ROIs": [
+        "scan_status",
+        "scan_time_countdown_readout"
       ]
     }
   ],

@@ -27,6 +27,7 @@ class RoiDraft:
     h: int = 0
     description: str = ""
     tags: str = ""
+    active: bool = True
 
     def to_json(self) -> dict[str, Any]:
         out: dict[str, Any] = {
@@ -36,6 +37,7 @@ class RoiDraft:
             "w": int(self.w),
             "h": int(self.h),
             "description": self.description,
+            "active": bool(self.active),
         }
         tags = [t.strip() for t in (self.tags or "").split(",") if t.strip()]
         if tags:
@@ -51,6 +53,7 @@ class AnchorDraft:
     description: str = ""
     tags: str = ""
     linked_rois: list[str] = field(default_factory=list)
+    active: bool = True
 
     def to_json(self) -> dict[str, Any]:
         out: dict[str, Any] = {
@@ -58,6 +61,7 @@ class AnchorDraft:
             "x": int(self.x),
             "y": int(self.y),
             "description": self.description,
+            "active": bool(self.active),
         }
         tags = [t.strip() for t in (self.tags or "").split(",") if t.strip()]
         if tags:
@@ -98,6 +102,20 @@ def _dedupe_name(existing: set[str], base: str) -> str:
     return f"{base}_{i}"
 
 
+def _parse_active(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"true", "1", "yes", "y"}:
+            return True
+        if lowered in {"false", "0", "no", "n"}:
+            return False
+    return True
+
+
 def _enable_windows_dpi_awareness() -> None:
     if sys.platform != "win32":
         return
@@ -134,6 +152,7 @@ class CalibratorApp(tk.Tk):
                         h=int(r.get("h", 0)),
                         description=str(r.get("description", "")),
                         tags=",".join(str(t) for t in (r.get("tags") or []) if isinstance(t, (str, int, float))),
+                        active=_parse_active(r.get("active", True)),
                     )
                 )
 
@@ -150,6 +169,7 @@ class CalibratorApp(tk.Tk):
                         description=str(a.get("description", "")),
                         tags=",".join(str(t) for t in (a.get("tags") or []) if isinstance(t, (str, int, float))),
                         linked_rois=linked_list,
+                        active=_parse_active(a.get("active", True)),
                     )
                 )
 
@@ -167,6 +187,12 @@ class CalibratorApp(tk.Tk):
         self._zoom: float = 1.0
         self._render_job: Optional[str] = None
         self._suppress_form_events: bool = False
+        self._help_window: Optional[tk.Toplevel] = None
+        self._help_btn: Optional[ttk.Button] = None
+        self._desc_text: Optional[tk.Text] = None
+        self._form_canvas: Optional[tk.Canvas] = None
+        self._form_inner: Optional[ttk.Frame] = None
+        self._form_window: Optional[int] = None
 
         self._build_ui()
         self._refresh_screenshot()
@@ -181,11 +207,22 @@ class CalibratorApp(tk.Tk):
             pass
 
     def _build_ui(self) -> None:
-        self.columnconfigure(1, weight=1)
+        self.columnconfigure(0, weight=1)
         self.rowconfigure(0, weight=1)
 
-        left = ttk.Frame(self, padding=8)
-        left.grid(row=0, column=0, sticky="nsew")
+        paned = tk.PanedWindow(
+            self,
+            orient=tk.HORIZONTAL,
+            sashrelief=tk.RAISED,
+            sashwidth=6,
+            sashpad=2,
+            showhandle=True,
+            handlesize=8,
+            sashcursor="sb_h_double_arrow",
+        )
+        paned.grid(row=0, column=0, sticky="nsew")
+
+        left = ttk.Frame(paned, padding=8)
         left.columnconfigure(0, weight=1)
         left.rowconfigure(1, weight=1)
 
@@ -201,6 +238,8 @@ class CalibratorApp(tk.Tk):
         self.items_list.grid(row=0, column=0, sticky="nsew")
         items_scroll.grid(row=0, column=1, sticky="ns")
         self.items_list.bind("<<ListboxSelect>>", lambda _e: self._on_select(populate_form=True))
+        self.items_list.bind("<Button-1>", self._on_items_click, add="+")
+        self._items_default_fg = str(self.items_list.cget("fg"))
 
         btns = ttk.Frame(left)
         btns.grid(row=2, column=0, sticky="ew", pady=(8, 0))
@@ -222,54 +261,34 @@ class CalibratorApp(tk.Tk):
             row=2, column=0, sticky="ew", pady=(6, 0)
         )
 
-        self.form = ttk.LabelFrame(left, text="Selected item", padding=8)
-        self.form.grid(row=4, column=0, sticky="ew", pady=(10, 0))
-
-        self.kind_var = tk.StringVar(value="")
-        ttk.Label(self.form, textvariable=self.kind_var).grid(row=0, column=0, columnspan=2, sticky="w")
-
-        self._fields: dict[str, tk.Entry] = {}
-        for i, field in enumerate(["name", "x", "y", "w", "h", "description", "tags"], start=1):
-            ttk.Label(self.form, text=field).grid(row=i, column=0, sticky="w", pady=2)
-            ent = ttk.Entry(self.form, width=30)
-            ent.configure(exportselection=False)
-            ent.grid(row=i, column=1, sticky="ew", pady=2)
-            ent.bind("<KeyRelease>", lambda _e, f=field: self._on_form_changed(source=f))
-            ent.bind("<FocusOut>", lambda _e, f=field: self._on_form_changed(source=f))
-            self._fields[field] = ent
-
-        self.form.columnconfigure(1, weight=1)
-
-        # Anchor-only: link ROIs that should be checked after using this anchor.
-        self._linked_frame = ttk.LabelFrame(self.form, text="Linked ROIs (anchor only)", padding=8)
-        self._linked_frame.grid(row=1 + 7, column=0, columnspan=2, sticky="ew", pady=(10, 0))
-        self._linked_frame.columnconfigure(0, weight=1)
-
-        self._linked_roi_var = tk.StringVar(value="")
-        self._linked_roi_combo = ttk.Combobox(self._linked_frame, textvariable=self._linked_roi_var, state="readonly")
-        self._linked_roi_combo.grid(row=0, column=0, sticky="ew")
-        self._linked_add_btn = ttk.Button(self._linked_frame, text="Add", command=self._add_linked_roi)
-        self._linked_add_btn.grid(row=0, column=1, padx=(6, 0))
-
-        self._linked_list = tk.Listbox(
-            self._linked_frame, height=5, selectmode=tk.EXTENDED, exportselection=False
-        )
-        self._linked_list.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(6, 0))
-        self._linked_remove_btn = ttk.Button(self._linked_frame, text="Remove selected", command=self._remove_linked_roi)
-        self._linked_remove_btn.grid(
-            row=2, column=0, columnspan=2, sticky="ew", pady=(6, 0)
-        )
-        self._set_linked_controls_enabled(False)
-
-        right = ttk.Frame(self, padding=8)
-        right.grid(row=0, column=1, sticky="nsew")
+        right = ttk.Frame(paned, padding=8)
         right.columnconfigure(0, weight=1)
         right.rowconfigure(0, weight=1)
 
-        preview = ttk.Frame(right)
-        preview.grid(row=0, column=0, sticky="nsew")
+        paned.add(left)
+        paned.add(right)
+        try:
+            paned.paneconfigure(left, minsize=260, stretch="never")
+            paned.paneconfigure(right, minsize=600, stretch="always")
+        except Exception:
+            pass
+
+        right_paned = tk.PanedWindow(
+            right,
+            orient=tk.VERTICAL,
+            sashrelief=tk.RAISED,
+            sashwidth=6,
+            sashpad=2,
+            showhandle=True,
+            handlesize=8,
+            sashcursor="sb_v_double_arrow",
+        )
+        right_paned.grid(row=0, column=0, sticky="nsew")
+
+        preview = ttk.Frame(right_paned)
         preview.columnconfigure(0, weight=1)
         preview.rowconfigure(0, weight=1)
+        right_paned.add(preview)
 
         self.canvas = tk.Canvas(preview, bg="#111111", highlightthickness=0)
         self.canvas.grid(row=0, column=0, sticky="nsew")
@@ -283,28 +302,160 @@ class CalibratorApp(tk.Tk):
         self.canvas.bind("<ButtonRelease-1>", self._on_mouse_up)
         self.canvas.bind("<Configure>", self._on_canvas_resize)
         self.canvas.bind("<Control-MouseWheel>", self._on_zoom)
+        self.canvas.bind("<MouseWheel>", self._on_preview_mousewheel)
+        self.canvas.bind("<Shift-MouseWheel>", self._on_preview_shift_mousewheel)
 
-        help_txt = (
+        self._help_text = (
             "Workflow:\n"
             "1) Select an item (or Add ROI/Anchor)\n"
-            "2) Click “Draw ROI box” or “Pick anchor point”\n"
+            "2) Click \"Draw ROI box\" or \"Pick anchor point\"\n"
             "3) Draw on the screenshot (drag for ROI; click for anchor)\n"
             "4) Save\n\n"
+            "Preview controls:\n"
+            "- Mouse wheel: scroll vertically\n"
+            "- Shift + wheel: scroll horizontally\n"
+            "- Ctrl + wheel: zoom\n\n"
             "Notes:\n"
             "- Coordinates are screen pixels (monitor-merged coordinate space).\n"
             "- Keep Nanonis window layout stable.\n"
         )
-        ttk.Label(right, text=help_txt, justify="left").grid(row=1, column=0, sticky="ew", pady=(8, 0))
+
+        bottom = ttk.Frame(right_paned)
+        bottom.columnconfigure(0, weight=1)
+        bottom.rowconfigure(1, weight=1)
+        right_paned.add(bottom)
+        try:
+            right_paned.paneconfigure(preview, minsize=300, stretch="always")
+            right_paned.paneconfigure(bottom, minsize=220, stretch="always")
+        except Exception:
+            pass
+        self._help_btn = ttk.Button(bottom, text="Help", command=self._show_help_tooltip)
+        self._help_btn.grid(row=0, column=0, sticky="e")
+
+        form_container = ttk.Frame(bottom)
+        form_container.grid(row=1, column=0, sticky="nsew", pady=(6, 0))
+        form_container.columnconfigure(0, weight=1)
+        form_container.rowconfigure(0, weight=1)
+
+        self._form_canvas = tk.Canvas(form_container, highlightthickness=0)
+        form_scroll = ttk.Scrollbar(form_container, orient="vertical", command=self._form_canvas.yview)
+        self._form_canvas.configure(yscrollcommand=form_scroll.set)
+        self._form_canvas.grid(row=0, column=0, sticky="nsew")
+        form_scroll.grid(row=0, column=1, sticky="ns")
+
+        self._form_inner = ttk.Frame(self._form_canvas)
+        self._form_window = self._form_canvas.create_window((0, 0), window=self._form_inner, anchor="nw")
+        self._form_inner.columnconfigure(0, weight=1)
+
+        self._form_inner.bind("<Configure>", self._on_form_inner_configure)
+        self._form_canvas.bind("<Configure>", self._on_form_canvas_configure)
+        self._form_canvas.bind("<MouseWheel>", self._on_form_mousewheel)
+
+        self.form = ttk.LabelFrame(self._form_inner, text="Selected item", padding=8)
+        self.form.grid(row=0, column=0, sticky="nsew")
+        self.form.columnconfigure(0, weight=1)
+        self.form.columnconfigure(1, weight=3)
+        self.form.rowconfigure(1, weight=1)
+
+        self.kind_var = tk.StringVar(value="")
+        ttk.Label(self.form, textvariable=self.kind_var).grid(row=0, column=0, columnspan=2, sticky="w")
+
+        left_col = ttk.Frame(self.form)
+        left_col.grid(row=1, column=0, sticky="nsew", padx=(0, 10))
+        left_col.columnconfigure(1, weight=1)
+
+        right_col = ttk.Frame(self.form)
+        right_col.grid(row=1, column=1, sticky="nsew")
+        right_col.columnconfigure(0, weight=1)
+        right_col.rowconfigure(1, weight=1)
+
+        self._fields = {}
+        field_order = ["name", "x", "y", "w", "h", "tags"]
+        for i, field in enumerate(field_order):
+            ttk.Label(left_col, text=field).grid(row=i, column=0, sticky="w", pady=2)
+            ent = ttk.Entry(left_col, width=18)
+            ent.configure(exportselection=False)
+            ent.grid(row=i, column=1, sticky="ew", pady=2)
+            ent.bind("<KeyRelease>", lambda _e, f=field: self._on_form_changed(source=f))
+            ent.bind("<FocusOut>", lambda _e, f=field: self._on_form_changed(source=f))
+            self._fields[field] = ent
+
+        ttk.Label(right_col, text="description").grid(row=0, column=0, sticky="w")
+        self._desc_text = tk.Text(right_col, height=8, wrap="word", exportselection=False)
+        self._desc_text.grid(row=1, column=0, sticky="nsew", pady=(2, 0))
+        self._desc_text.bind("<KeyRelease>", lambda _e: self._on_form_changed(source="description"))
+        self._desc_text.bind("<FocusOut>", lambda _e: self._on_form_changed(source="description"))
+
+        # Anchor-only: link ROIs that should be checked after using this anchor.
+        self._linked_frame = ttk.LabelFrame(left_col, text="Linked ROIs (anchor only)", padding=8)
+        linked_row = len(field_order)
+        self._linked_frame.grid(row=linked_row, column=0, columnspan=2, sticky="nsew", pady=(10, 0))
+        self._linked_frame.columnconfigure(0, weight=1)
+        self._linked_frame.rowconfigure(1, weight=1)
+        left_col.rowconfigure(linked_row, weight=1)
+
+        self._linked_roi_var = tk.StringVar(value="")
+        self._linked_roi_combo = ttk.Combobox(self._linked_frame, textvariable=self._linked_roi_var, state="readonly")
+        self._linked_roi_combo.grid(row=0, column=0, sticky="ew")
+        self._linked_add_btn = ttk.Button(self._linked_frame, text="Add", command=self._add_linked_roi)
+        self._linked_add_btn.grid(row=0, column=1, padx=(6, 0))
+
+        self._linked_list = tk.Listbox(
+            self._linked_frame, height=5, selectmode=tk.EXTENDED, exportselection=False
+        )
+        self._linked_list.grid(row=1, column=0, columnspan=2, sticky="nsew", pady=(6, 0))
+        self._linked_remove_btn = ttk.Button(self._linked_frame, text="Remove selected", command=self._remove_linked_roi)
+        self._linked_remove_btn.grid(
+            row=2, column=0, columnspan=2, sticky="ew", pady=(6, 0)
+        )
+        self._set_linked_controls_enabled(False)
 
         self._refresh_roi_options()
 
     def _refresh_list(self) -> None:
+        forced_rois = self._apply_forced_roi_activation()
         self.items_list.delete(0, tk.END)
         for r in self.rois:
-            self.items_list.insert(tk.END, f"[ROI] {r.name}")
+            list_idx = self.items_list.size()
+            self.items_list.insert(tk.END, self._format_item_label(kind="roi", name=r.name, active=r.active))
+            if r.name in forced_rois:
+                self.items_list.itemconfig(list_idx, foreground="#808080")
+            else:
+                self.items_list.itemconfig(list_idx, foreground=self._items_default_fg)
         for a in self.anchors:
-            self.items_list.insert(tk.END, f"[ANCHOR] {a.name}")
+            list_idx = self.items_list.size()
+            self.items_list.insert(tk.END, self._format_item_label(kind="anchor", name=a.name, active=a.active))
+            self.items_list.itemconfig(list_idx, foreground=self._items_default_fg)
         self._refresh_roi_options()
+
+    def _format_item_label(self, *, kind: ItemKind, name: str, active: bool) -> str:
+        box = "[x]" if active else "[ ]"
+        tag = "[ROI]" if kind == "roi" else "[ANCHOR]"
+        return f"{box} {tag} {name}"
+
+    def _forced_roi_names(self) -> set[str]:
+        roi_names = {r.name for r in self.rois if r.name}
+        forced: set[str] = set()
+        for a in self.anchors:
+            if not a.active:
+                continue
+            for name in a.linked_rois or []:
+                if name in roi_names:
+                    forced.add(name)
+        return forced
+
+    def _apply_forced_roi_activation(self) -> set[str]:
+        forced = self._forced_roi_names()
+        if forced:
+            for r in self.rois:
+                if r.name in forced and not r.active:
+                    r.active = True
+        return forced
+
+    def _list_index_to_item(self, list_idx: int) -> tuple[ItemKind, int]:
+        if list_idx < len(self.rois):
+            return ("roi", list_idx)
+        return ("anchor", list_idx - len(self.rois))
 
     def _refresh_roi_options(self) -> None:
         try:
@@ -363,6 +514,95 @@ class CalibratorApp(tk.Tk):
         except Exception:
             pass
 
+    def _on_form_inner_configure(self, _e: tk.Event) -> None:
+        if self._form_canvas is None:
+            return
+        try:
+            self._form_canvas.configure(scrollregion=self._form_canvas.bbox("all"))
+        except Exception:
+            pass
+
+    def _on_form_canvas_configure(self, _e: tk.Event) -> None:
+        if self._form_canvas is None or self._form_window is None:
+            return
+        try:
+            self._form_canvas.itemconfigure(self._form_window, width=self._form_canvas.winfo_width())
+        except Exception:
+            pass
+
+    def _on_form_mousewheel(self, e: tk.Event) -> str:
+        if self._form_canvas is None:
+            return "break"
+        delta = getattr(e, "delta", 0)
+        if not delta:
+            return "break"
+        self._form_canvas.yview_scroll(int(-1 * (delta / 120)), "units")
+        return "break"
+
+    def _on_preview_mousewheel(self, e: tk.Event) -> str:
+        if self._screen_img is None:
+            return "break"
+        state = getattr(e, "state", 0)
+        if state & 0x0004 or state & 0x0001:
+            return "break"
+        delta = getattr(e, "delta", 0)
+        if not delta:
+            return "break"
+        self.canvas.yview_scroll(int(-1 * (delta / 120)), "units")
+        return "break"
+
+    def _on_preview_shift_mousewheel(self, e: tk.Event) -> str:
+        if self._screen_img is None:
+            return "break"
+        state = getattr(e, "state", 0)
+        if state & 0x0004:
+            return "break"
+        delta = getattr(e, "delta", 0)
+        if not delta:
+            return "break"
+        self.canvas.xview_scroll(int(-1 * (delta / 120)), "units")
+        return "break"
+
+    def _show_help_tooltip(self) -> None:
+        if self._help_window is not None and self._help_window.winfo_exists():
+            self._hide_help_tooltip()
+            return
+
+        win = tk.Toplevel(self)
+        win.title("Help")
+        win.resizable(False, False)
+        try:
+            win.attributes("-topmost", True)
+        except Exception:
+            pass
+
+        ttk.Label(win, text=self._help_text, justify="left", padding=10).grid(row=0, column=0, sticky="w")
+        win.update_idletasks()
+
+        x = self.winfo_rootx() + 50
+        y = self.winfo_rooty() + 50
+        if self._help_btn is not None and self._help_btn.winfo_exists():
+            x = self._help_btn.winfo_rootx()
+            y = self._help_btn.winfo_rooty() + self._help_btn.winfo_height()
+        win.geometry(f"+{x}+{y}")
+
+        win.bind("<Escape>", lambda _e: self._hide_help_tooltip())
+        win.bind("<FocusOut>", lambda _e: self._hide_help_tooltip())
+        try:
+            win.focus_set()
+        except Exception:
+            pass
+        self._help_window = win
+
+    def _hide_help_tooltip(self) -> None:
+        if self._help_window is None:
+            return
+        try:
+            self._help_window.destroy()
+        except Exception:
+            pass
+        self._help_window = None
+
     def _selected(self) -> tuple[Optional[ItemKind], Optional[int]]:
         sel = self.items_list.curselection()
         if not sel:
@@ -372,6 +612,37 @@ class CalibratorApp(tk.Tk):
             return ("roi", idx)
         return ("anchor", idx - len(self.rois))
 
+    def _on_items_click(self, e: tk.Event) -> Optional[str]:
+        idx = self.items_list.nearest(e.y)
+        if idx < 0:
+            return None
+        bbox = self.items_list.bbox(idx)
+        if not bbox:
+            return None
+        x0, _y0, _w, _h = bbox
+        if e.x > x0 + 22:
+            return None
+
+        kind, item_idx = self._list_index_to_item(idx)
+        forced = self._forced_roi_names()
+        if kind == "roi":
+            item = self.rois[item_idx]
+            if item.name in forced:
+                self.items_list.selection_clear(0, tk.END)
+                self.items_list.selection_set(idx)
+                self._on_select(populate_form=True)
+                return "break"
+            item.active = not item.active
+        else:
+            item = self.anchors[item_idx]
+            item.active = not item.active
+
+        self._refresh_list()
+        self.items_list.selection_clear(0, tk.END)
+        self.items_list.selection_set(idx)
+        self._on_select(populate_form=True)
+        return "break"
+
     def _on_select(self, *, populate_form: bool = True) -> None:
         kind, idx = self._selected()
         self._clear_overlay()
@@ -380,6 +651,7 @@ class CalibratorApp(tk.Tk):
                 self.kind_var.set("")
                 for e in self._fields.values():
                     e.delete(0, tk.END)
+                self._set_description("")
             return
 
         if populate_form:
@@ -416,9 +688,23 @@ class CalibratorApp(tk.Tk):
             self._draw_existing_anchor(self.anchors[idx])
 
     def _set_field(self, key: str, value: str) -> None:
+        if key == "description":
+            self._set_description(value)
+            return
         ent = self._fields[key]
         ent.delete(0, tk.END)
         ent.insert(0, value)
+
+    def _set_description(self, value: str) -> None:
+        if self._desc_text is None:
+            return
+        self._desc_text.delete("1.0", tk.END)
+        self._desc_text.insert("1.0", value or "")
+
+    def _get_description(self) -> str:
+        if self._desc_text is None:
+            return ""
+        return self._desc_text.get("1.0", tk.END).rstrip("\n")
 
     def _try_int(self, value: str) -> Optional[int]:
         s = (value or "").strip()
@@ -431,10 +717,20 @@ class CalibratorApp(tk.Tk):
 
     def _update_selected_list_label(self, *, kind: ItemKind, idx: int) -> None:
         list_idx = idx if kind == "roi" else len(self.rois) + idx
-        label = f"[ROI] {self.rois[idx].name}" if kind == "roi" else f"[ANCHOR] {self.anchors[idx].name}"
+        if kind == "roi":
+            item = self.rois[idx]
+            label = self._format_item_label(kind="roi", name=item.name, active=item.active)
+        else:
+            item = self.anchors[idx]
+            label = self._format_item_label(kind="anchor", name=item.name, active=item.active)
         try:
             self.items_list.delete(list_idx)
             self.items_list.insert(list_idx, label)
+            forced = self._forced_roi_names()
+            if kind == "roi" and item.name in forced:
+                self.items_list.itemconfig(list_idx, foreground="#808080")
+            else:
+                self.items_list.itemconfig(list_idx, foreground=self._items_default_fg)
             self.items_list.selection_clear(0, tk.END)
             self.items_list.selection_set(list_idx)
         except Exception:
@@ -450,7 +746,7 @@ class CalibratorApp(tk.Tk):
         name_in = self._fields["name"].get().strip()
         x_in = self._try_int(self._fields["x"].get())
         y_in = self._try_int(self._fields["y"].get())
-        description_in = self._fields["description"].get()
+        description_in = self._get_description()
         tags_in = self._fields["tags"].get()
 
         if kind == "roi":
@@ -465,6 +761,7 @@ class CalibratorApp(tk.Tk):
                 h=cur.h if (h_in is None or h_in <= 0) else h_in,
                 description=description_in,
                 tags=tags_in,
+                active=cur.active,
             )
             if source in {"name"}:
                 self._refresh_roi_options()
@@ -482,12 +779,17 @@ class CalibratorApp(tk.Tk):
                 description=description_in,
                 tags=tags_in,
                 linked_rois=linked,
+                active=cur.active,
             )
             if source in {"name"}:
                 self._update_selected_list_label(kind="anchor", idx=idx)
             if source in {"x", "y"}:
                 self._clear_overlay()
                 self._draw_existing_anchor(self.anchors[idx])
+            if source in {"linked_rois"}:
+                self._refresh_list()
+                self.items_list.selection_clear(0, tk.END)
+                self.items_list.selection_set(len(self.rois) + idx)
 
     def _add_roi(self) -> None:
         existing = {r.name for r in self.rois}
@@ -526,6 +828,7 @@ class CalibratorApp(tk.Tk):
 
     def _save(self) -> None:
         try:
+            self._apply_forced_roi_activation()
             names: set[str] = set()
             roi_names: set[str] = set()
             for r in self.rois:
@@ -757,7 +1060,13 @@ class CalibratorApp(tk.Tk):
             idx = self._drawing_item_index
             a = self.anchors[idx]
             self.anchors[idx] = AnchorDraft(
-                name=a.name, x=sx, y=sy, description=a.description, tags=a.tags, linked_rois=list(a.linked_rois or [])
+                name=a.name,
+                x=sx,
+                y=sy,
+                description=a.description,
+                tags=a.tags,
+                linked_rois=list(a.linked_rois or []),
+                active=a.active,
             )
             self._refresh_list()
             self.items_list.selection_clear(0, tk.END)
@@ -794,7 +1103,16 @@ class CalibratorApp(tk.Tk):
 
         idx = self._drawing_item_index
         r = self.rois[idx]
-        self.rois[idx] = RoiDraft(name=r.name, x=sx1, y=sy1, w=w, h=h, description=r.description, tags=r.tags)
+        self.rois[idx] = RoiDraft(
+            name=r.name,
+            x=sx1,
+            y=sy1,
+            w=w,
+            h=h,
+            description=r.description,
+            tags=r.tags,
+            active=r.active,
+        )
 
         self._refresh_list()
         self.items_list.selection_clear(0, tk.END)
