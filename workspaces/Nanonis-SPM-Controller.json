@@ -2,10 +2,10 @@
   "rois": [
     {
       "name": "bias_readout",
-      "x": -1067,
-      "y": 231,
-      "w": 114,
-      "h": 34,
+      "x": -1068,
+      "y": 208,
+      "w": 100,
+      "h": 38,
       "description": "ROI covering the displayed bias value (V) in Nanonis.",
       "active": true,
       "tags": [

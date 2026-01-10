@@ -5,7 +5,21 @@ import sys
 from pathlib import Path
 from typing import Optional
 
+from .tui_settings import DEFAULT_SETTINGS_PATH, load_tui_settings
 from .workspace import Workspace, load_workspace
+
+
+def _resolve_workspace_path(raw: str, *, repo_root: Path, settings_path: Path) -> Path:
+    path = Path(raw)
+    if path.is_absolute():
+        return path
+    candidate = repo_root / path
+    if candidate.exists():
+        return candidate
+    alt = settings_path.parent / path
+    if alt.exists():
+        return alt
+    return path
 
 def main(argv: Optional[list[str]] = None) -> int:
     ap = argparse.ArgumentParser(description="Visual automation agent MVP (screenshots + fixed anchors).")
@@ -20,9 +34,17 @@ def main(argv: Optional[list[str]] = None) -> int:
         from .agent import AgentConfig, VisualAutomationAgent
         from .chat_tui import run_chat_tui
 
-        ws_path = Path("workspace.json")
+        repo_root = Path(__file__).resolve().parent.parent
+        settings_path = repo_root / DEFAULT_SETTINGS_PATH
+        st = load_tui_settings(settings_path)
+        ws_path = repo_root / "workspace.json"
+        if st.workspace:
+            ws_path = _resolve_workspace_path(st.workspace, repo_root=repo_root, settings_path=settings_path)
         if not ws_path.exists():
-            raise ValueError("Missing workspace.json. Create one with `python -m src.calibrate_gui --workspace workspace.json`.")
+            raise ValueError(
+                f"Missing workspace file: {ws_path}. Update sessions/.tui_settings.json "
+                "or create one with `python -m src.calibrate_gui --workspace workspace.json`."
+            )
         workspace: Workspace = load_workspace(ws_path)
         agent = VisualAutomationAgent(
             workspace=workspace,

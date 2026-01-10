@@ -231,14 +231,14 @@ class ChatApp(App[None]):
         self._session_log_roots: set[str] = set()
         self._cache_usage_inflight: bool = False
         self._cache_usage_text: str = ""
-        self._settings_path = DEFAULT_SETTINGS_PATH
+        self._repo_root = Path(__file__).resolve().parent.parent
+        self._settings_path = self._repo_root / DEFAULT_SETTINGS_PATH
+        self._settings_workspace_raw: Optional[str] = None
+        self._settings_mtime: Optional[float] = None
 
     def _persisted_settings_snapshot(self) -> TuiSettings:
         cfg = self._agent.config
-        try:
-            ws_path = str(self._agent.workspace.source_path)
-        except Exception:
-            ws_path = None
+        ws_path = self._settings_workspace_raw or self._persisted_workspace_value()
         return TuiSettings(
             workspace=ws_path,
             agent_model=str(getattr(cfg, "agent_model", "") or "").strip() or None,
@@ -254,9 +254,42 @@ class ChatApp(App[None]):
             memory_compress_threshold_tokens=int(getattr(cfg, "memory_compress_threshold_tokens", 300_000)),
         )
 
+    def _persisted_workspace_value(self) -> Optional[str]:
+        try:
+            path = Path(self._agent.workspace.source_path)
+        except Exception:
+            return None
+        if not path.is_absolute():
+            candidate = self._repo_root / path
+            if candidate.exists():
+                path = candidate
+        try:
+            return str(path.resolve().relative_to(self._repo_root))
+        except Exception:
+            try:
+                return str(path.resolve())
+            except Exception:
+                return str(path)
+
+    def _resolve_workspace_path(self, raw: str) -> str:
+        path = Path(raw)
+        if path.is_absolute():
+            return str(path)
+        candidate = self._repo_root / path
+        if candidate.exists():
+            return str(candidate)
+        alt = self._settings_path.parent / path
+        if alt.exists():
+            return str(alt)
+        return raw
+
     def _save_persisted_settings(self) -> None:
         try:
             save_tui_settings(self._persisted_settings_snapshot(), self._settings_path)
+            try:
+                self._settings_mtime = self._settings_path.stat().st_mtime
+            except Exception:
+                pass
         except Exception:
             pass
 
@@ -266,10 +299,18 @@ class ChatApp(App[None]):
         except Exception:
             return
         try:
-            if st.workspace:
-                self._agent.set_workspace(st.workspace)
+            self._settings_mtime = self._settings_path.stat().st_mtime
         except Exception:
             pass
+        try:
+            if st.workspace:
+                resolved = self._resolve_workspace_path(st.workspace)
+                self._agent.set_workspace(resolved)
+                self._settings_workspace_raw = None
+        except Exception as e:
+            if st.workspace:
+                self._settings_workspace_raw = st.workspace
+            self._append_error(f"Failed to load workspace from settings: {e}")
         try:
             if st.agent_model:
                 self._agent.set_agent_model(st.agent_model)
@@ -315,6 +356,39 @@ class ChatApp(App[None]):
                 self._agent.set_memory_compress_threshold_tokens(int(st.memory_compress_threshold_tokens))
         except Exception:
             pass
+
+    def _maybe_reload_workspace_from_settings(self) -> None:
+        try:
+            mtime = self._settings_path.stat().st_mtime
+        except Exception:
+            return
+        if self._settings_mtime is not None and mtime <= self._settings_mtime:
+            return
+        self._settings_mtime = mtime
+        try:
+            st = load_tui_settings(self._settings_path)
+        except Exception as e:
+            self._append_error(f"Failed to read settings: {e}")
+            return
+        if not st.workspace:
+            return
+        resolved = self._resolve_workspace_path(st.workspace)
+        try:
+            current = str(self._agent.workspace.source_path)
+        except Exception:
+            current = ""
+        try:
+            if Path(resolved).resolve() == Path(current).resolve():
+                return
+        except Exception:
+            if resolved == current:
+                return
+        try:
+            self._agent.set_workspace(resolved)
+            self._settings_workspace_raw = None
+        except Exception as e:
+            self._settings_workspace_raw = st.workspace
+            self._append_error(f"Failed to load workspace from settings: {e}")
 
     def on_unmount(self) -> None:
         if not self._current_session_saved:
@@ -1246,6 +1320,7 @@ class ChatApp(App[None]):
                 return True
             try:
                 self._agent.set_workspace(rest)
+                self._settings_workspace_raw = None
                 self._save_persisted_settings()
                 self._append_block("Workspace", f"Workspace set to: {self._agent.workspace.source_path}")
             except Exception as e:
@@ -1540,6 +1615,8 @@ class ChatApp(App[None]):
         if self.busy:
             self._append_error("Busy; wait for the agent to finish the current turn.")
             return
+
+        self._maybe_reload_workspace_from_settings()
 
         if self._confirm_mode == "new_session":
             if text == "1":
